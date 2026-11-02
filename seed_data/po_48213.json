@@ -1,0 +1,164 @@
+{
+  "po_number": "PO-48213",
+  "supplier": "Nordic BuildSupply DK",
+  "order_date": "2026-10-28",
+  "expected_delivery_date": "2026-11-02",
+  "status": "OPEN",
+  "total_lines": 14,
+  "lines": [
+    {
+      "line_number": 1,
+      "sku": "CEM-25",
+      "sku_code": "CEM-25",
+      "description": "Aalborg Portland Rapid Cement 25kg",
+      "item_name": "Aalborg Portland Rapid Cement 25kg",
+      "ordered_qty": 80.0,
+      "unit": "BAG",
+      "initial_on_hand": 120.0,
+      "initial_atp": 120.0
+    },
+    {
+      "line_number": 2,
+      "sku": "TIM-4595",
+      "sku_code": "TIM-4595",
+      "description": "C24 Structural Timber 45x95mm 4.2m",
+      "item_name": "C24 Structural Timber 45x95mm 4.2m",
+      "ordered_qty": 40.0,
+      "unit": "PCS",
+      "initial_on_hand": 85.0,
+      "initial_atp": 85.0
+    },
+    {
+      "line_number": 3,
+      "sku": "PLAST-01",
+      "sku_code": "PLAST-01",
+      "description": "Gyproc Standard Plasterboard 13x1200x2400",
+      "item_name": "Gyproc Standard Plasterboard 13x1200x2400",
+      "ordered_qty": 60.0,
+      "unit": "SHEET",
+      "initial_on_hand": 30.0,
+      "initial_atp": 30.0
+    },
+    {
+      "line_number": 4,
+      "sku": "INSUL-100",
+      "sku_code": "INSUL-100",
+      "description": "Rockwool Flexi Acoustic Insulation 100mm",
+      "item_name": "Rockwool Flexi Acoustic Insulation 100mm",
+      "ordered_qty": 50.0,
+      "unit": "PACK",
+      "initial_on_hand": 45.0,
+      "initial_atp": 45.0
+    },
+    {
+      "line_number": 5,
+      "sku": "BRICK-RED",
+      "sku_code": "BRICK-RED",
+      "description": "Danish Red Facing Bricks RT 475",
+      "item_name": "Danish Red Facing Bricks RT 475",
+      "ordered_qty": 1200.0,
+      "unit": "PCS",
+      "initial_on_hand": 2500.0,
+      "initial_atp": 2500.0
+    },
+    {
+      "line_number": 6,
+      "sku": "SAND-04",
+      "sku_code": "SAND-04",
+      "description": "Fine Grain Washed Sharp Sand 0-4mm 25kg",
+      "item_name": "Fine Grain Washed Sharp Sand 0-4mm 25kg",
+      "ordered_qty": 100.0,
+      "unit": "BAG",
+      "initial_on_hand": 150.0,
+      "initial_atp": 150.0
+    },
+    {
+      "line_number": 7,
+      "sku": "GRAV-1020",
+      "sku_code": "GRAV-1020",
+      "description": "Pea Shingle Drainage Gravel 10-20mm 25kg",
+      "item_name": "Pea Shingle Drainage Gravel 10-20mm 25kg",
+      "ordered_qty": 60.0,
+      "unit": "BAG",
+      "initial_on_hand": 90.0,
+      "initial_atp": 90.0
+    },
+    {
+      "line_number": 8,
+      "sku": "REBAR-12",
+      "sku_code": "REBAR-12",
+      "description": "High Yield Deformed Rebar Steel 12mm x 6m",
+      "item_name": "High Yield Deformed Rebar Steel 12mm x 6m",
+      "ordered_qty": 30.0,
+      "unit": "PCS",
+      "initial_on_hand": 40.0,
+      "initial_atp": 40.0
+    },
+    {
+      "line_number": 9,
+      "sku": "PLY-18",
+      "sku_code": "PLY-18",
+      "description": "Nordic Structural Birch Plywood 18mm",
+      "item_name": "Nordic Structural Birch Plywood 18mm",
+      "ordered_qty": 25.0,
+      "unit": "SHEET",
+      "initial_on_hand": 35.0,
+      "initial_atp": 35.0
+    },
+    {
+      "line_number": 10,
+      "sku": "SCREW-550",
+      "sku_code": "SCREW-550",
+      "description": "Spax Stainless Torx Wood Screws 5.0x50mm (200pk)",
+      "item_name": "Spax Stainless Torx Wood Screws 5.0x50mm (200pk)",
+      "ordered_qty": 35.0,
+      "unit": "BOX",
+      "initial_on_hand": 50.0,
+      "initial_atp": 50.0
+    },
+    {
+      "line_number": 11,
+      "sku": "ROOF-FELT",
+      "sku_code": "ROOF-FELT",
+      "description": "Icopal Top SBS Bitumen Roofing Felt 10m",
+      "item_name": "Icopal Top SBS Bitumen Roofing Felt 10m",
+      "ordered_qty": 20.0,
+      "unit": "ROLL",
+      "initial_on_hand": 15.0,
+      "initial_atp": 15.0
+    },
+    {
+      "line_number": 12,
+      "sku": "MORTAR-MIX",
+      "sku_code": "MORTAR-MIX",
+      "description": "Weber Premix Masonry Mortar M5 25kg",
+      "item_name": "Weber Premix Masonry Mortar M5 25kg",
+      "ordered_qty": 75.0,
+      "unit": "BAG",
+      "initial_on_hand": 110.0,
+      "initial_atp": 110.0
+    },
+    {
+      "line_number": 13,
+      "sku": "PAINT-WHT",
+      "sku_code": "PAINT-WHT",
+      "description": "Nordsjö Professional Acryl Wall Paint 10L White",
+      "item_name": "Nordsjö Professional Acryl Wall Paint 10L White",
+      "ordered_qty": 30.0,
+      "unit": "CAN",
+      "initial_on_hand": 25.0,
+      "initial_atp": 25.0
+    },
+    {
+      "line_number": 14,
+      "sku": "SEAL-SIL",
+      "sku_code": "SEAL-SIL",
+      "description": "Dana Lim Sanitary Construction Silicone 310ml",
+      "item_name": "Dana Lim Sanitary Construction Silicone 310ml",
+      "ordered_qty": 45.0,
+      "unit": "TUBE",
+      "initial_on_hand": 65.0,
+      "initial_atp": 65.0
+    }
+  ]
+}
