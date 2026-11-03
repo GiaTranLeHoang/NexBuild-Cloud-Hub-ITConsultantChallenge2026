@@ -78,10 +78,10 @@ def test_scan_delivery_note_matching_engine():
     assert items_map["FIX-M8"]["confidence_score"] == 0.68
     assert items_map["FIX-M8"]["requires_review"] is True
 
-    # Summary
+    # Summary - Phase 2: OCR returns all 14 PO-48213 lines (12 OK + PLAST-01 SHORT + FIX-M8 UNKNOWN_SKU)
     summary = data["summary"]
-    assert summary["total_scanned_items"] == 4
-    assert summary["matched_ok_count"] == 2
+    assert summary["total_scanned_items"] == 14
+    assert summary["matched_ok_count"] == 12
     assert summary["discrepancy_count"] == 2
     assert summary["requires_supervisor_approval"] is True
 
