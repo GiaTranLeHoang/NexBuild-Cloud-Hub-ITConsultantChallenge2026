@@ -1,4 +1,4 @@
-# Leader's baseline smoke tests for /backend. QA Lead (Dau) can add test_mvp_flow.py alongside this file without conflicts.
+﻿# Leader's baseline smoke tests for /backend. QA Lead (Dau) can add test_mvp_flow.py alongside this file without conflicts.
 from __future__ import annotations
 
 import pytest
@@ -20,22 +20,21 @@ def test_health_check():
     response = client.get("/api/v1/health")
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "healthy"
+    assert data["status"] == "ok"  # Phase 3 spec: health returns "ok"
     assert "NexBuild Cloud Hub" in data["service"]
 
 
 def test_get_po_48213_details():
     response = client.get("/api/v1/po/PO-48213")
     assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    po = data["po"]
+    # Phase 3: POHeaderResponse is returned directly (no wrapper {"status","po"})
+    po = response.json()
     assert po["po_number"] == "PO-48213"
-    assert po["supplier"] == "Nordic BuildSupply DK"
+    assert po["supplier_name"] == "Nordic BuildSupply DK"
     assert len(po["lines"]) == 14
 
-    # Verify core items from slide mockup
-    sku_map = {line["sku"]: line for line in po["lines"]}
+    # Verify core items using canonical sku_code key
+    sku_map = {line["sku_code"]: line for line in po["lines"]}
     assert sku_map["CEM-25"]["ordered_qty"] == 80.0
     assert sku_map["TIM-4595"]["ordered_qty"] == 40.0
     assert sku_map["PLAST-01"]["ordered_qty"] == 60.0

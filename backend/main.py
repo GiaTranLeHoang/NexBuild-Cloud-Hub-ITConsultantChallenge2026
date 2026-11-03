@@ -1,62 +1,101 @@
 """
-NexBuild Cloud Hub - FastAPI Main Application
-Exposes RESTful endpoints for Denmark Goods Receiving, PO Matching,
-Idempotent Receipt Confirmation, and Real-time ATP Inventory Lookup.
+NexBuild Cloud Hub - FastAPI Main Application (Phase 3 Locked)
+
+REST API for Denmark Phase 1 MVP:
+  Scan → Match PO → Confirm → Post Hub → ATP Lookup
+
+Endpoints (all prefixed /api/v1):
+  GET  /health
+  GET  /po/{po_number}
+  POST /scan-delivery-note          (JSON body)
+  POST /scan-delivery-note/upload   (multipart file)
+  POST /confirm-receipt             (idempotent)
+  GET  /inventory/atp
+  GET  /audit-logs
+  POST /reset-demo
+
+Compatible with Python 3.9+.
 """
 
 from __future__ import annotations
 
-import os
 import json
+import logging
+import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request, status, UploadFile, File, Form
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
+import sys
+import os as _os
+_os.sys = sys  # noqa: keep linters happy on Windows path hacks
+
+# ── Local imports ──────────────────────────────────────────────────────────
 from backend.database import (
-    init_db,
     get_db_connection,
-    reset_and_reseed_db
+    init_db,
+    seed_baseline_data,
+    reset_and_reseed_db,
 )
 from backend.schemas import (
-    PODetailResponse,
-    POHeader,
-    POLineItem,
+    # PO
+    POLineSchema,
+    POHeaderResponse,
+    # Scan / match
     ScanDeliveryNoteRequest,
     ScanDeliveryNoteResponse,
+    ScannedLineItem,
+    MatchingSummary,
+    # Confirm receipt
     ConfirmReceiptRequest,
+    ConfirmLineItemInput,
     ReceiptTransactionResponse,
+    # Inventory
+    InventoryATPItem,
     InventoryATPResponse,
-    InventoryItem,
+    # Audit / errors
+    AuditLogEntry,
+    StandardErrorResponse,
+    # Demo reset
     ResetDemoResponse,
-    ErrorResponse
+    # Backward-compat aliases (used in legacy idempotency replay path)
+    InventoryItem,
+    ErrorResponse,
 )
-from backend.ai_ocr_service import process_delivery_note
-from backend.matching_engine import match_scanned_delivery_note
-from backend.mock_erp_adapter import sync_goods_receipt_to_erp
+from backend.ai_ocr_service import extract_delivery_note, process_delivery_note
+from backend.matching_engine import reconcile_scanned_items, match_scanned_delivery_note
+from backend.mock_erp_adapter import sync_to_denmark_erp, sync_goods_receipt_to_erp
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initializes SQLite schema and auto-seeds PO-48213 data upon boot."""
+    """Boot-time DB init & deterministic seeding of PO-48213."""
     init_db()
+    seed_baseline_data(force_reset=False)   # seed if empty; don't wipe on every restart
+    logger.info("NexBuild Cloud Hub started. DB ready.")
     yield
 
 
-# Initialize FastAPI application
 app = FastAPI(
-    title="NexBuild Cloud Hub API",
-    description="Denmark Goods Receiving & Real-Time ATP Lookup Service (Round 2 MVP)",
+    title="NexBuild Cloud Hub MVP",
+    description=(
+        "Denmark Phase 1 MVP — Goods Receiving, PO Matching, "
+        "Idempotent Receipt Confirmation & Real-Time ATP Lookup."
+    ),
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-# Enable CORS for all origins to allow seamless frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,45 +105,92 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------
-# Health Check Endpoint
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _trust_status(last_updated_iso: Optional[str]) -> str:
+    """Return GREEN / AMBER / RED based on staleness of last inventory update."""
+    if not last_updated_iso:
+        return "AMBER"
+    try:
+        ts = datetime.fromisoformat(last_updated_iso.replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - ts
+        if age <= timedelta(minutes=15):
+            return "GREEN"
+        if age <= timedelta(hours=2):
+            return "AMBER"
+        return "RED"
+    except Exception:
+        return "AMBER"
+
+
+def _build_inventory_item(row: Any, now_iso: str) -> InventoryATPItem:
+    """Map a sqlite3.Row from inventory_hub to InventoryATPItem."""
+    last_updated = row["last_updated"] or row["updated_at"] or now_iso
+    return InventoryATPItem(
+        sku_code=row["sku_code"] or row["sku"],
+        item_name=row["item_name"] or row["description"] or "",
+        category=row["category"] or "",
+        physical_on_hand=float(row["physical_on_hand"]),
+        reserved_qty=float(row["reserved_qty"] or 0.0),
+        committed_qty=float(row["committed_qty"] or 0.0),
+        atp_qty=float(row["atp_qty"]),
+        quarantine_qty=float(row["quarantine_qty"] or 0.0),
+        last_updated=last_updated,
+        trust_status=_trust_status(last_updated),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 0. Health Check
+# ---------------------------------------------------------------------------
+
 @app.get("/api/v1/health", tags=["System"])
 def health_check():
-    """Returns application health status, ERP adapter status, and active OCR mode."""
+    """Returns service health, ERP adapter status, and active OCR mode."""
     gemini_key = os.getenv("GEMINI_API_KEY", "")
-    ocr_mode = "live_gemini" if (gemini_key and gemini_key != "your_api_key_here") else "deterministic_fallback"
+    ocr_mode = (
+        "live_gemini"
+        if gemini_key and gemini_key != "your_api_key_here"
+        else "deterministic_fallback"
+    )
     return {
-        "status": "healthy",
-        "service": "NexBuild Cloud Hub (Denmark MVP)",
-        "erp_adapter_status": "ONLINE (Assumed Denmark Legacy ERP)",
-        "active_ocr_mode": ocr_mode,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "status":               "ok",
+        "active_ocr_mode":      ocr_mode,
+        "service":              "NexBuild Cloud Hub (Denmark MVP)",
+        "erp_adapter_status":   "ONLINE (Assumed Denmark Legacy ERP)",
+        "timestamp":            datetime.now(timezone.utc).isoformat() + "Z",
     }
 
 
-# ---------------------------------------------------------
-# 1. PO Lookup Endpoint
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 1. PO Lookup
+# ---------------------------------------------------------------------------
+
 @app.get(
     "/api/v1/po/{po_number}",
-    response_model=PODetailResponse,
+    response_model=POHeaderResponse,
     responses={404: {"model": ErrorResponse}},
-    tags=["Purchase Orders"]
+    tags=["Purchase Orders"],
 )
 def get_po_details(po_number: str):
     """
-    Retrieves purchase order header and line items for the Denmark Distribution Hub.
-    Auto-seeded with PO-48213 (14 lines from Nordic BuildSupply DK).
+    Returns PO header + all 14 line items for PO-48213 (Nordic BuildSupply DK).
+    Used by the Receive Goods screen to pre-populate expected quantities.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT po_number, supplier, order_date, expected_delivery_date, status, total_lines, created_at, updated_at
+    cursor.execute(
+        """
+        SELECT po_number, supplier_name, supplier, store_id,
+               status, created_at
         FROM po_headers
-        WHERE po_number = ?;
-    """, (po_number,))
+        WHERE po_number = ?
+        """,
+        (po_number,),
+    )
     header_row = cursor.fetchone()
 
     if not header_row:
@@ -112,510 +198,630 @@ def get_po_details(po_number: str):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
-                "status": "error",
+                "status":     "error",
                 "error_code": "PO_NOT_FOUND",
-                "message": f"Purchase order '{po_number}' was not found in Denmark Hub registry.",
-                "details": {"requested_po_number": po_number}
-            }
+                "message":    f"Purchase order '{po_number}' not found in Denmark Hub registry.",
+                "details":    {"requested_po_number": po_number},
+            },
         )
 
-    cursor.execute("""
-        SELECT id, po_number, line_number, sku, description, ordered_qty, received_qty, unit, status
+    cursor.execute(
+        """
+        SELECT id, po_number, line_number, sku_code, sku, item_name, description,
+               ordered_qty, received_qty, unit, status
         FROM po_lines
         WHERE po_number = ?
-        ORDER BY line_number ASC;
-    """, (po_number,))
+        ORDER BY id ASC
+        """,
+        (po_number,),
+    )
     line_rows = cursor.fetchall()
     conn.close()
 
     lines = [
-        POLineItem(
-            id=row["id"],
-            po_number=row["po_number"],
-            line_number=row["line_number"],
-            sku=row["sku"],
-            description=row["description"],
-            ordered_qty=float(row["ordered_qty"]),
-            received_qty=float(row["received_qty"]),
-            unit=row["unit"],
-            status=row["status"]
+        POLineSchema(
+            id=r["id"],
+            po_number=r["po_number"],
+            line_number=r["line_number"] or 1,
+            sku_code=r["sku_code"] or r["sku"],
+            item_name=r["item_name"] or r["description"] or "",
+            ordered_qty=float(r["ordered_qty"]),
+            received_qty=float(r["received_qty"]),
+            unit=r["unit"],
+            status=r["status"] or "PENDING",
         )
-        for row in line_rows
+        for r in line_rows
     ]
 
-    header = POHeader(
+    supplier = header_row["supplier_name"] or header_row["supplier"] or ""
+
+    return POHeaderResponse(
         po_number=header_row["po_number"],
-        supplier=header_row["supplier"],
-        order_date=header_row["order_date"],
-        expected_delivery_date=header_row["expected_delivery_date"],
-        status=header_row["status"],
-        total_lines=header_row["total_lines"],
-        created_at=header_row["created_at"],
-        updated_at=header_row["updated_at"],
-        lines=lines
+        supplier_name=supplier,
+        store_id=header_row["store_id"] or "DK-Aarhus-01",
+        status=header_row["status"] or "OPEN",
+        created_at=header_row["created_at"] or datetime.now(timezone.utc).isoformat(),
+        lines=lines,
+        total_lines=len(lines),
     )
 
-    return PODetailResponse(status="success", po=header)
 
+# ---------------------------------------------------------------------------
+# 2a. Scan Delivery Note (JSON body)
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------
-# 2. Delivery Note Scanning & Matching Endpoint
-# ---------------------------------------------------------
 @app.post(
     "/api/v1/scan-delivery-note",
     response_model=ScanDeliveryNoteResponse,
-    tags=["Goods Receiving"]
+    tags=["Goods Receiving"],
 )
-def scan_delivery_note(request_payload: Optional[ScanDeliveryNoteRequest] = None):
+async def scan_delivery_note(
+    request_payload: Optional[ScanDeliveryNoteRequest] = None,
+):
     """
-    Simulates or performs OCR scanning on a supplier delivery note, then triggers the
-    Matching Engine to compare scanned items against the Purchase Order.
+    Triggers AI OCR (demo mode) on PO-48213 delivery note, then runs the
+    Matching Engine to produce line-by-line reconciliation with match_status,
+    confidence_score, and discrepancy details.
 
-    Standard demo scenario for PO-48213:
-    - CEM-25: 80 received (OK)
-    - TIM-4595: 40 received (OK)
-    - PLAST-01: 52 received (SHORT - 8 missing)
-    - FIX-M8: 12 received (UNKNOWN_SKU - confidence 0.68)
+    Demo scenario outcome:
+      CEM-25   → OK    (80 == 80)
+      TIM-4595 → OK    (40 == 40)
+      PLAST-01 → SHORT (52 < 60, deficit -8)
+      FIX-M8   → UNKNOWN_SKU (not on PO, conf 0.68)
+      10 others → OK
     """
-    po_number = request_payload.po_number if request_payload and request_payload.po_number else "PO-48213"
-    sim_text = request_payload.simulated_ocr_text if request_payload else None
+    po_number = (
+        request_payload.po_number
+        if request_payload and request_payload.po_number
+        else "PO-48213"
+    )
 
-    # Step A: Run AI OCR service (returns scanned raw items with confidence scores)
-    ocr_result = process_delivery_note(po_number=po_number, simulated_text=sim_text)
+    # Step A: OCR extraction (always demo mode for Phase 1 MVP)
+    scanned_items = await extract_delivery_note(use_demo_sample=True)
 
-    # Step B: Run Matching Engine against PO database lines
-    matched_result = match_scanned_delivery_note(ocr_result)
+    # Step B: Matching engine
+    conn = get_db_connection()
+    try:
+        result = reconcile_scanned_items(scanned_items, po_number, conn)
+    finally:
+        conn.close()
 
-    return matched_result
+    return ScanDeliveryNoteResponse(**result)
 
+
+# ---------------------------------------------------------------------------
+# 2b. Scan Delivery Note (multipart file upload)
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/api/v1/scan-delivery-note/upload",
     response_model=ScanDeliveryNoteResponse,
-    tags=["Goods Receiving"]
+    tags=["Goods Receiving"],
 )
-async def scan_delivery_note_file(
+async def scan_delivery_note_upload(
     po_number: str = Form("PO-48213"),
-    file: Optional[UploadFile] = File(None)
+    file: Optional[UploadFile] = File(None),
 ):
     """
-    Multipart file upload variant for mobile camera capture or PDF delivery note scans.
-    Falls back gracefully to the deterministic mock pipeline for PO-48213.
+    Multipart variant — accepts camera capture / PDF scan of delivery note.
+    Falls back to deterministic mock when no API key is configured.
     """
-    file_bytes = await file.read() if file else None
-    ocr_result = process_delivery_note(po_number=po_number, file_bytes=file_bytes)
-    matched_result = match_scanned_delivery_note(ocr_result)
-    return matched_result
+    image_bytes = await file.read() if file else None
+    scanned_items = await extract_delivery_note(
+        image_bytes=image_bytes,
+        use_demo_sample=(image_bytes is None),
+    )
+
+    conn = get_db_connection()
+    try:
+        result = reconcile_scanned_items(scanned_items, po_number, conn)
+    finally:
+        conn.close()
+
+    return ScanDeliveryNoteResponse(**result)
 
 
-# ---------------------------------------------------------
-# 3. Confirm Goods Receipt Endpoint (Idempotent)
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 3. Confirm Goods Receipt (idempotent, quarantine-aware)
+# ---------------------------------------------------------------------------
+
 @app.post(
     "/api/v1/confirm-receipt",
     response_model=ReceiptTransactionResponse,
-    tags=["Goods Receiving"]
+    tags=["Goods Receiving"],
 )
 def confirm_receipt(payload: ConfirmReceiptRequest):
     """
-    Confirms received goods, updates inventory (physical on-hand and ATP),
-    records tamper-evident audit logs, and triggers synchronization with the Assumed Denmark Legacy ERP.
+    Confirms received goods and posts inventory updates.
 
-    Offline Idempotency Protection:
-    - Checks `idempotency_key` before modifying database state.
-    - If key has already been processed, returns the existing committed transaction
-      without double-counting inventory.
+    Idempotency:
+      If the supplied idempotency_key was already processed, the cached
+      response is returned immediately — inventory is NOT touched again.
 
-    Quarantine Business Logic:
-    - If a line is an UNKNOWN_SKU (not on PO) and not explicitly overridden with
-      reason_code == "accept_unordered_override", it is quarantined:
-      * atp_qty is NOT incremented (remains untouched).
-      * physical_on_hand is NOT incremented into sellable stock.
-      * quarantine_qty is incremented.
-      * audit_logs records 'QUARANTINED_UNORDERED_SKU'.
+    Quarantine logic (per Round 1 proposal & Phase 1 spec):
+      UNKNOWN_SKU lines (e.g. FIX-M8) or reason_code=="unordered_quarantine":
+        → quarantine_qty += received_qty
+        → physical_on_hand unchanged
+        → atp_qty unchanged
+        → audit_logs ACTION = "QUARANTINED_UNORDERED_SKU"
+      Unless reason_code == "accept_unordered_override" (supervisor approval).
+
+      Valid PO lines (CEM-25, PLAST-01, etc.):
+        → physical_on_hand += received_qty
+        → atp_qty += received_qty (Phase 1: reserved=0, committed=0)
+        → audit_logs ACTION = "GOODS_RECEIPT_CONFIRMED"
     """
+    # Normalise lines from either field alias
+    lines: List[ConfirmLineItemInput] = (
+        payload.confirmed_lines or payload.lines or []
+    )
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat() + "Z"
 
-    # Step 1: Idempotency check
-    cursor.execute("""
-        SELECT idempotency_key, po_number, employee_id, store_id, processed_at, status, payload_summary, erp_sync_status, erp_transaction_id
-        FROM receipt_transactions
-        WHERE idempotency_key = ?;
-    """, (payload.idempotency_key,))
+    # ------------------------------------------------------------------
+    # STEP 1: Idempotency guard
+    # ------------------------------------------------------------------
+    cursor.execute(
+        "SELECT * FROM receipt_transactions WHERE idempotency_key = ?",
+        (payload.idempotency_key,),
+    )
     existing_tx = cursor.fetchone()
 
     if existing_tx:
-        # Transaction was previously executed. Replay cached result safely.
-        summary_data = json.loads(existing_tx["payload_summary"]) if existing_tx["payload_summary"] else {}
-        conn.close()
+        # Return cached response without touching inventory
+        raw_json = existing_tx["response_json"] or existing_tx["payload_summary"] or "{}"
+        cached = json.loads(raw_json) if raw_json else {}
 
         # Fetch current inventory snapshot for the confirmed lines
-        current_inv = []
-        conn2 = get_db_connection()
-        c2 = conn2.cursor()
-        for line in payload.confirmed_lines:
-            c2.execute("SELECT * FROM inventory_hub WHERE sku = ?", (line.sku,))
-            row = c2.fetchone()
+        snapshot: List[InventoryATPItem] = []
+        for line in lines:
+            sku = line.sku_code or line.sku or ""
+            cursor.execute(
+                "SELECT * FROM inventory_hub WHERE sku_code = ? OR sku = ?",
+                (sku, sku),
+            )
+            row = cursor.fetchone()
             if row:
-                current_inv.append(InventoryItem(
-                    sku=row["sku"],
-                    description=row["description"],
-                    category=row["category"],
-                    physical_on_hand=float(row["physical_on_hand"]),
-                    quarantine_qty=float(row["quarantine_qty"] if "quarantine_qty" in row.keys() else 0.0),
-                    reserved_qty=float(row["reserved_qty"]),
-                    atp_qty=float(row["atp_qty"]),
-                    unit=row["unit"],
-                    location=row["location"],
-                    updated_at=row["updated_at"]
-                ))
-        conn2.close()
+                snapshot.append(_build_inventory_item(row, now_iso))
+        conn.close()
 
         return ReceiptTransactionResponse(
             status="success",
-            message="Idempotent replay: Receipt transaction was already processed and verified.",
+            message="Idempotent replay: Receipt already processed. Inventory unchanged.",
             idempotency_key=existing_tx["idempotency_key"],
             po_number=existing_tx["po_number"],
             employee_id=existing_tx["employee_id"],
             store_id=existing_tx["store_id"],
             is_idempotent_replay=True,
-            processed_at=existing_tx["processed_at"],
-            updated_inventory=current_inv,
-            erp_sync=summary_data.get("erp_sync", {
-                "sync_status": existing_tx["erp_sync_status"],
-                "erp_transaction_id": existing_tx["erp_transaction_id"]
-            })
+            processed_at=existing_tx["processed_at"] or existing_tx["created_at"] or now_iso,
+            updated_inventory=snapshot,
+            erp_sync=cached.get("erp_sync", {"sync_status": "REPLAYED"}),
         )
 
-    # Step 2: Process new receipt transaction atomically
+    # ------------------------------------------------------------------
+    # STEP 2: Process new receipt — atomic transaction
+    # ------------------------------------------------------------------
     try:
-        updated_inventory_items: List[InventoryItem] = []
+        updated_inventory: List[InventoryATPItem] = []
 
-        for line in payload.confirmed_lines:
+        for line in lines:
+            sku = line.sku_code or getattr(line, "sku", None) or ""
             received_qty = float(line.received_qty)
+            unit = line.unit or "pcs"
+            match_status = getattr(line, "match_status", None) or ""
+            line_reason = getattr(line, "reason_code", None) or ""
+            line_photo = getattr(line, "photo_evidence", None) or getattr(payload, "photo_evidence", None)
+            line_notes = getattr(line, "notes", None) or getattr(payload, "notes", None)
 
-            # Check if SKU exists on the Purchase Order
-            cursor.execute("""
-                SELECT line_number, ordered_qty FROM po_lines
-                WHERE po_number = ? AND sku = ?;
-            """, (payload.po_number, line.sku))
-            po_line_match = cursor.fetchone()
-            is_on_po = po_line_match is not None
+            # ── Is this SKU on the PO? ──────────────────────────────────
+            cursor.execute(
+                "SELECT ordered_qty FROM po_lines WHERE po_number = ? AND (sku_code = ? OR sku = ?)",
+                (payload.po_number, sku, sku),
+            )
+            po_line_row = cursor.fetchone()
+            is_on_po: bool = po_line_row is not None
 
-            # Determine quarantine vs normal receipt
-            reason = line.reason_code or ("NORMAL_GOODS_RECEIPT" if is_on_po else "unordered_quarantine")
-            is_unordered_quarantine = (not is_on_po) and (reason != "accept_unordered_override")
+            # ── Determine quarantine vs normal receipt ──────────────────
+            is_quarantine: bool = (
+                match_status == "UNKNOWN_SKU"
+                or line_reason in ("unordered_quarantine", "not_on_po")
+                or (not is_on_po and line_reason != "accept_unordered_override")
+            )
 
-            cursor.execute("SELECT * FROM inventory_hub WHERE sku = ?;", (line.sku,))
+            effective_reason = (
+                line_reason
+                or ("NORMAL_GOODS_RECEIPT" if is_on_po else "unordered_quarantine")
+            )
+
+            # ── Fetch current inventory row ─────────────────────────────
+            cursor.execute(
+                "SELECT * FROM inventory_hub WHERE sku_code = ? OR sku = ?",
+                (sku, sku),
+            )
             inv_row = cursor.fetchone()
 
-            if is_unordered_quarantine:
-                # -----------------------------------------------------
-                # UNKNOWN_SKU / UNORDERED: DO NOT INCREMENT atp_qty!
-                # Quarantined: atp_qty & physical_on_hand remain baseline.
-                # Increment quarantine_qty and log QUARANTINED_UNORDERED_SKU.
-                # -----------------------------------------------------
+            if is_quarantine:
+                # --------------------------------------------------------
+                # QUARANTINE PATH — do NOT touch physical_on_hand / atp_qty
+                # --------------------------------------------------------
                 if inv_row:
-                    current_physical = float(inv_row["physical_on_hand"])
-                    current_atp = float(inv_row["atp_qty"])
-                    new_quarantine = float(inv_row["quarantine_qty"] if "quarantine_qty" in inv_row.keys() else 0.0) + received_qty
+                    cur_physical = float(inv_row["physical_on_hand"])
+                    cur_atp = float(inv_row["atp_qty"])
+                    new_quarantine = float(inv_row["quarantine_qty"] or 0.0) + received_qty
 
-                    cursor.execute("""
+                    cursor.execute(
+                        """
                         UPDATE inventory_hub
-                        SET quarantine_qty = ?, updated_at = ?
-                        WHERE sku = ?;
-                    """, (new_quarantine, now_iso, line.sku))
+                        SET quarantine_qty = ?, last_updated = ?, updated_at = ?
+                        WHERE sku_code = ? OR sku = ?
+                        """,
+                        (new_quarantine, now_iso, now_iso, sku, sku),
+                    )
+                    updated_inventory.append(
+                        _build_inventory_item(
+                            # Re-fetch to get the refreshed row fields
+                            _patch_row(inv_row, quarantine_qty=new_quarantine, last_updated=now_iso),
+                            now_iso,
+                        )
+                    )
 
-                    updated_inventory_items.append(InventoryItem(
-                        sku=inv_row["sku"],
-                        description=inv_row["description"],
-                        category=inv_row["category"],
-                        physical_on_hand=current_physical,
-                        quarantine_qty=new_quarantine,
-                        reserved_qty=float(inv_row["reserved_qty"]),
-                        atp_qty=current_atp,
-                        unit=inv_row["unit"],
-                        location=inv_row["location"],
-                        updated_at=now_iso
-                    ))
                 else:
-                    item_desc = f"Quarantined Unordered Material ({line.sku})"
-                    cursor.execute("""
-                        INSERT INTO inventory_hub (sku, description, category, physical_on_hand, quarantine_qty, reserved_qty, atp_qty, unit, location, updated_at)
-                        VALUES (?, ?, 'Quarantine Bay', 0.0, ?, 0.0, 0.0, ?, 'Receiving Quarantine Zone', ?);
-                    """, (line.sku, item_desc, received_qty, line.unit, now_iso))
-
-                    updated_inventory_items.append(InventoryItem(
-                        sku=line.sku,
-                        description=item_desc,
+                    # SKU not in inventory at all — create quarantine slot
+                    cursor.execute(
+                        """
+                        INSERT INTO inventory_hub
+                            (sku_code, sku, item_name, description, category,
+                             physical_on_hand, quarantine_qty, reserved_qty,
+                             committed_qty, atp_qty,
+                             last_updated, updated_at)
+                        VALUES (?, ?, ?, ?, 'Quarantine Bay',
+                                0.0, ?, 0.0, 0.0, 0.0, ?, ?)
+                        """,
+                        (
+                            sku, sku,
+                            f"Quarantined Material ({sku})",
+                            f"Unordered item received — quarantine pending clearance ({sku})",
+                            received_qty,
+                            now_iso, now_iso,
+                        ),
+                    )
+                    updated_inventory.append(InventoryATPItem(
+                        sku_code=sku,
+                        item_name=f"Quarantined Material ({sku})",
                         category="Quarantine Bay",
                         physical_on_hand=0.0,
-                        quarantine_qty=received_qty,
                         reserved_qty=0.0,
+                        committed_qty=0.0,
                         atp_qty=0.0,
-                        unit=line.unit,
-                        location="Receiving Quarantine Zone",
-                        updated_at=now_iso
+                        quarantine_qty=received_qty,
+                        last_updated=now_iso,
+                        trust_status="AMBER",
                     ))
 
-                # Log Quarantine Audit Record
-                photo = line.photo_evidence or payload.photo_evidence
-                notes = line.notes or payload.notes or f"Unordered item {line.sku} ({received_qty} {line.unit}) placed in quarantine pending purchasing/vendor resolution."
-
-                cursor.execute("""
-                    INSERT INTO audit_logs (timestamp, employee_id, action, po_number, sku, quantity_change, reason_code, photo_evidence, notes)
-                    VALUES (?, ?, 'QUARANTINED_UNORDERED_SKU', ?, ?, ?, ?, ?, ?);
-                """, (now_iso, payload.employee_id, payload.po_number, line.sku, received_qty, reason, photo, notes))
+                # Quarantine audit record
+                cursor.execute(
+                    """
+                    INSERT INTO audit_logs
+                        (timestamp, employee_id, store_id, po_number,
+                         sku_code, sku, action, reason_code,
+                         quantity_change, photo_evidence, notes, details)
+                    VALUES (?, ?, ?, ?, ?, ?, 'QUARANTINED_UNORDERED_SKU', ?,
+                            ?, ?, ?, ?)
+                    """,
+                    (
+                        now_iso, payload.employee_id, payload.store_id,
+                        payload.po_number,
+                        sku, sku,
+                        effective_reason,
+                        received_qty, line_photo,
+                        line_notes or f"Unordered item {sku} ({received_qty} {unit}) quarantined.",
+                        f"QUARANTINED_UNORDERED_SKU: sku={sku} qty={received_qty} unit={unit}",
+                    ),
+                )
 
             else:
-                # -----------------------------------------------------
-                # VERIFIED PO ITEM OR EXPLICIT OVERRIDE:
-                # Add ONLY received quantity to physical_on_hand & atp_qty
-                # -----------------------------------------------------
+                # --------------------------------------------------------
+                # NORMAL RECEIPT PATH — increment physical_on_hand + atp_qty
+                # --------------------------------------------------------
                 if inv_row:
                     new_physical = float(inv_row["physical_on_hand"]) + received_qty
                     new_atp = float(inv_row["atp_qty"]) + received_qty
-                    current_quarantine = float(inv_row["quarantine_qty"] if "quarantine_qty" in inv_row.keys() else 0.0)
+                    cur_quarantine = float(inv_row["quarantine_qty"] or 0.0)
 
-                    cursor.execute("""
+                    cursor.execute(
+                        """
                         UPDATE inventory_hub
-                        SET physical_on_hand = ?, atp_qty = ?, updated_at = ?
-                        WHERE sku = ?;
-                    """, (new_physical, new_atp, now_iso, line.sku))
+                        SET physical_on_hand = ?,
+                            atp_qty = ?,
+                            last_updated = ?,
+                            updated_at = ?
+                        WHERE sku_code = ? OR sku = ?
+                        """,
+                        (new_physical, new_atp, now_iso, now_iso, sku, sku),
+                    )
+                    updated_inventory.append(
+                        _build_inventory_item(
+                            _patch_row(
+                                inv_row,
+                                physical_on_hand=new_physical,
+                                atp_qty=new_atp,
+                                last_updated=now_iso,
+                            ),
+                            now_iso,
+                        )
+                    )
 
-                    updated_inventory_items.append(InventoryItem(
-                        sku=inv_row["sku"],
-                        description=inv_row["description"],
-                        category=inv_row["category"],
-                        physical_on_hand=new_physical,
-                        quarantine_qty=current_quarantine,
-                        reserved_qty=float(inv_row["reserved_qty"]),
-                        atp_qty=new_atp,
-                        unit=inv_row["unit"],
-                        location=inv_row["location"],
-                        updated_at=now_iso
-                    ))
                 else:
-                    item_desc = f"Newly Received Material ({line.sku})"
-                    cursor.execute("""
-                        INSERT INTO inventory_hub (sku, description, category, physical_on_hand, quarantine_qty, reserved_qty, atp_qty, unit, location, updated_at)
-                        VALUES (?, ?, 'General Fasteners', ?, 0.0, 0.0, ?, ?, 'Receiving Staging Zone', ?);
-                    """, (line.sku, item_desc, received_qty, received_qty, line.unit, now_iso))
-
-                    updated_inventory_items.append(InventoryItem(
-                        sku=line.sku,
-                        description=item_desc,
-                        category="General Fasteners",
+                    # SKU not yet in inventory — create fresh record
+                    item_desc = f"Newly Received Material ({sku})"
+                    cursor.execute(
+                        """
+                        INSERT INTO inventory_hub
+                            (sku_code, sku, item_name, description, category,
+                             physical_on_hand, quarantine_qty, reserved_qty,
+                             committed_qty, atp_qty,
+                             last_updated, updated_at)
+                        VALUES (?, ?, ?, ?, 'General Materials',
+                                ?, 0.0, 0.0, 0.0, ?,
+                                ?, ?)
+                        """,
+                        (
+                            sku, sku, item_desc, item_desc,
+                            received_qty, received_qty,
+                            now_iso, now_iso,
+                        ),
+                    )
+                    updated_inventory.append(InventoryATPItem(
+                        sku_code=sku,
+                        item_name=item_desc,
+                        category="General Materials",
                         physical_on_hand=received_qty,
-                        quarantine_qty=0.0,
                         reserved_qty=0.0,
+                        committed_qty=0.0,
                         atp_qty=received_qty,
-                        unit=line.unit,
-                        location="Receiving Staging Zone",
-                        updated_at=now_iso
+                        quarantine_qty=0.0,
+                        last_updated=now_iso,
+                        trust_status="GREEN",
                     ))
 
-                # Update PO line status if line is on the PO
+                # Update po_lines.received_qty
                 if is_on_po:
-                    cursor.execute("""
+                    cursor.execute(
+                        """
                         UPDATE po_lines
                         SET received_qty = received_qty + ?,
-                            status = CASE 
+                            status = CASE
                                 WHEN (received_qty + ?) >= ordered_qty THEN 'COMPLETED'
                                 ELSE 'PARTIALLY_RECEIVED'
                             END
-                        WHERE po_number = ? AND sku = ?;
-                    """, (received_qty, received_qty, payload.po_number, line.sku))
+                        WHERE po_number = ? AND (sku_code = ? OR sku = ?)
+                        """,
+                        (received_qty, received_qty, payload.po_number, sku, sku),
+                    )
 
-                # Log Normal Goods Receipt Confirmation
-                action = "GOODS_RECEIPT_OVERRIDE_ACCEPTED" if not is_on_po else "GOODS_RECEIPT_CONFIRMED"
-                photo = line.photo_evidence or payload.photo_evidence
-                notes = line.notes or payload.notes or "Goods receipt confirmed by warehouse staff"
+                audit_action = (
+                    "GOODS_RECEIPT_OVERRIDE_ACCEPTED"
+                    if not is_on_po
+                    else "GOODS_RECEIPT_CONFIRMED"
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO audit_logs
+                        (timestamp, employee_id, store_id, po_number,
+                         sku_code, sku, action, reason_code,
+                         quantity_change, photo_evidence, notes, details)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now_iso, payload.employee_id, payload.store_id,
+                        payload.po_number,
+                        sku, sku,
+                        audit_action,
+                        effective_reason,
+                        received_qty, line_photo,
+                        line_notes or "Goods receipt confirmed by warehouse staff.",
+                        f"{audit_action}: sku={sku} qty={received_qty} unit={unit}",
+                    ),
+                )
 
-                cursor.execute("""
-                    INSERT INTO audit_logs (timestamp, employee_id, action, po_number, sku, quantity_change, reason_code, photo_evidence, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (now_iso, payload.employee_id, action, payload.po_number, line.sku, received_qty, reason, photo, notes))
-
-        # D. Trigger Mock Denmark ERP Adapter synchronization
-        erp_sync_result = sync_goods_receipt_to_erp(
-            po_number=payload.po_number,
-            confirmed_lines=[l.model_dump() for l in payload.confirmed_lines],
-            employee_id=payload.employee_id,
-            store_id=payload.store_id,
-            idempotency_key=payload.idempotency_key
+        # ── Update PO header status ─────────────────────────────────────
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS pending
+            FROM po_lines
+            WHERE po_number = ? AND status != 'COMPLETED'
+            """,
+            (payload.po_number,),
+        )
+        pending_row = cursor.fetchone()
+        po_new_status = (
+            "PARTIALLY_RECEIVED"
+            if (pending_row and pending_row["pending"] > 0)
+            else "COMPLETED"
+        )
+        cursor.execute(
+            "UPDATE po_headers SET status = ?, updated_at = ? WHERE po_number = ?",
+            (po_new_status, now_iso, payload.po_number),
         )
 
-        # E. Record in receipt_transactions to enforce idempotency
-        payload_summary_json = json.dumps({
-            "confirmed_lines_count": len(payload.confirmed_lines),
-            "erp_sync": erp_sync_result
-        })
+        # ── ERP sync ────────────────────────────────────────────────────
+        erp_result = sync_to_denmark_erp(
+            po_number=payload.po_number,
+            confirmed_lines=[ln.model_dump() for ln in lines],
+            employee_id=payload.employee_id,
+            store_id=payload.store_id,
+            idempotency_key=payload.idempotency_key,
+        )
 
-        cursor.execute("""
-            INSERT INTO receipt_transactions (
-                idempotency_key, po_number, employee_id, store_id, processed_at, status, payload_summary, erp_sync_status, erp_transaction_id
-            ) VALUES (?, ?, ?, ?, ?, 'SUCCESS', ?, ?, ?);
-        """, (
-            payload.idempotency_key,
-            payload.po_number,
-            payload.employee_id,
-            payload.store_id,
-            now_iso,
-            payload_summary_json,
-            erp_sync_result["sync_status"],
-            erp_sync_result["erp_transaction_id"]
-        ))
+        # ── Record in receipt_transactions (idempotency seal) ───────────
+        response_payload = {
+            "confirmed_lines_count": len(lines),
+            "erp_sync": erp_result,
+        }
+        response_json = json.dumps(response_payload)
 
-        # Check if PO should be marked PARTIALLY_RECEIVED or COMPLETED
-        cursor.execute("""
-            SELECT COUNT(*) AS pending_count
-            FROM po_lines
-            WHERE po_number = ? AND status != 'COMPLETED';
-        """, (payload.po_number,))
-        pending_row = cursor.fetchone()
-        po_status = "PARTIALLY_RECEIVED" if (pending_row and pending_row["pending_count"] > 0) else "COMPLETED"
-
-        cursor.execute("""
-            UPDATE po_headers
-            SET status = ?, updated_at = ?
-            WHERE po_number = ?;
-        """, (po_status, now_iso, payload.po_number))
+        cursor.execute(
+            """
+            INSERT INTO receipt_transactions
+                (idempotency_key, po_number, employee_id, store_id,
+                 erp_voucher_no, response_json, created_at, processed_at,
+                 status, erp_sync_status, erp_transaction_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUCCESS', ?, ?)
+            """,
+            (
+                payload.idempotency_key,
+                payload.po_number,
+                payload.employee_id,
+                payload.store_id,
+                erp_result["erp_voucher_no"],
+                response_json,
+                now_iso,
+                now_iso,
+                erp_result["sync_status"],
+                erp_result["erp_transaction_id"],
+            ),
+        )
 
         conn.commit()
         conn.close()
 
         return ReceiptTransactionResponse(
             status="success",
-            message="Goods receipt successfully confirmed, inventory posted, and Denmark ERP synced.",
+            message=(
+                "Goods receipt confirmed. Inventory posted. "
+                f"Denmark ERP synced ({erp_result['erp_voucher_no']})."
+            ),
             idempotency_key=payload.idempotency_key,
             po_number=payload.po_number,
             employee_id=payload.employee_id,
             store_id=payload.store_id,
             is_idempotent_replay=False,
             processed_at=now_iso,
-            updated_inventory=updated_inventory_items,
-            erp_sync=erp_sync_result
+            updated_inventory=updated_inventory,
+            erp_sync=erp_result,
         )
 
     except Exception as exc:
         conn.rollback()
         conn.close()
+        logger.exception("confirm_receipt failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
-                "status": "error",
+                "status":     "error",
                 "error_code": "CONFIRM_RECEIPT_ERROR",
-                "message": f"Failed to confirm goods receipt: {str(exc)}",
-                "details": {"idempotency_key": payload.idempotency_key}
-            }
+                "message":    f"Failed to confirm goods receipt: {exc}",
+                "details":    {"idempotency_key": payload.idempotency_key},
+            },
         )
 
 
-# ---------------------------------------------------------
-# 4. Real-time ATP Inventory Lookup Endpoint
-# ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4. Real-time ATP Inventory
+# ---------------------------------------------------------------------------
+
 @app.get(
     "/api/v1/inventory/atp",
     response_model=InventoryATPResponse,
-    tags=["Store Counter ATP"]
+    tags=["Store Counter ATP"],
 )
 def get_inventory_atp(
     sku: Optional[str] = None,
     category: Optional[str] = None,
-    store_id: str = "DK-HUB-01"
+    store_id: str = "DK-Aarhus-01",
 ):
     """
-    Returns real-time stock levels and Available-To-Promise (ATP) quantities
-    for the Store Counter Clerk interface.
+    Returns real-time ATP quantities for all SKUs in the Denmark Distribution Hub.
+    trust_status = GREEN  if last_updated within 15 minutes
+                 = AMBER  if within 2 hours
+                 = RED    if older than 2 hours
     """
     conn = get_db_connection()
     cursor = conn.cursor()
+    now_iso = datetime.now(timezone.utc).isoformat() + "Z"
 
     query = "SELECT * FROM inventory_hub WHERE 1=1"
     params: List[Any] = []
 
     if sku:
-        query += " AND (sku LIKE ? OR description LIKE ?)"
-        params.extend([f"%{sku}%", f"%{sku}%"])
+        query += " AND (sku_code LIKE ? OR sku LIKE ? OR item_name LIKE ? OR description LIKE ?)"
+        params.extend([f"%{sku}%"] * 4)
     if category:
         query += " AND category = ?"
         params.append(category)
 
-    query += " ORDER BY sku ASC;"
+    query += " ORDER BY sku_code ASC"
 
     cursor.execute(query, tuple(params))
     rows = cursor.fetchall()
     conn.close()
 
-    items = [
-        InventoryItem(
-            sku=row["sku"],
-            sku_code=row["sku"],
-            description=row["description"],
-            item_name=row["description"],
-            category=row["category"],
-            physical_on_hand=float(row["physical_on_hand"]),
-            quarantine_qty=float(row["quarantine_qty"] if "quarantine_qty" in row.keys() else 0.0),
-            reserved_qty=float(row["reserved_qty"]),
-            atp_qty=float(row["atp_qty"]),
-            unit=row["unit"],
-            location=row["location"],
-            updated_at=row["updated_at"],
-            last_updated=row["updated_at"],
-            trust_status="GREEN"
-        )
-        for row in rows
-    ]
+    items = [_build_inventory_item(row, now_iso) for row in rows]
 
     return InventoryATPResponse(
-        status="success",
         store_id=store_id,
+        items=items,
         total_skus=len(items),
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        items=items
+        total_items=len(items),
     )
 
 
-# ---------------------------------------------------------
-# 5. Reset Demo Database Endpoint
-# ---------------------------------------------------------
-@app.post(
-    "/api/v1/reset-demo",
-    response_model=ResetDemoResponse,
-    tags=["Demo Administration"]
-)
-def reset_demo():
-    """
-    Truncates all operational tables and reseeds clean baseline data
-    (PO-48213 with 14 lines and initial inventory quantities).
-    Essential for running clean demo video takes.
-    """
-    result = reset_and_reseed_db()
-    return ResetDemoResponse(**result)
+# ---------------------------------------------------------------------------
+# 5. Audit Logs
+# ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------
-# 6. Audit Logs Inspection Endpoint (QA & Debugging)
-# ---------------------------------------------------------
 @app.get("/api/v1/audit-logs", tags=["Audit & Governance"])
 def get_audit_logs(limit: int = 50):
-    """Returns recent audit log records including employee_id, reason_code, and photo_evidence."""
+    """Returns recent audit records ordered by newest timestamp first."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, timestamp, employee_id, action, po_number, sku, quantity_change, reason_code, photo_evidence, notes
+    cursor.execute(
+        """
+        SELECT id, timestamp, employee_id, store_id, po_number,
+               sku_code, sku, action, reason_code,
+               quantity_change, photo_evidence, notes, details
         FROM audit_logs
         ORDER BY id DESC
-        LIMIT ?;
-    """, (limit,))
+        LIMIT ?
+        """,
+        (limit,),
+    )
     rows = cursor.fetchall()
     conn.close()
 
     return {
         "status": "success",
-        "count": len(rows),
-        "logs": [dict(r) for r in rows]
+        "count":  len(rows),
+        "logs":   [dict(r) for r in rows],
     }
+
+
+# ---------------------------------------------------------------------------
+# 6. Reset Demo
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/api/v1/reset-demo",
+    response_model=ResetDemoResponse,
+    tags=["Demo Administration"],
+)
+def reset_demo():
+    """
+    Truncates all operational tables and reseeds clean PO-48213 baseline data.
+    Essential for clean demo video takes.
+    """
+    result = reset_and_reseed_db()
+    return ResetDemoResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper — patch a sqlite3.Row-like dict with updated field values
+# ---------------------------------------------------------------------------
+
+def _patch_row(row: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Return a mutable dict copy of a sqlite3.Row with fields overwritten."""
+    d = dict(row)
+    d.update(kwargs)
+    return d
