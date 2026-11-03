@@ -1,206 +1,296 @@
-# NexBuild Cloud Hub: System Context & Architecture Specification
-**Denmark Phase 1 MVP — Goods Receiving & Real-Time ATP Lookup**  
-*Document Version:* 1.1.0 | *Status:* Aligned with Round 1 Winning Proposal | *Author:* Gia (Backend Architect & Team Leader)
+# NexBuild Cloud Hub — System Context & Architecture
+**Denmark Phase 1 MVP · Goods Receiving & Real-Time ATP Lookup**
+
+| Field | Value |
+|:--|:--|
+| **Document Version** | 2.0.0 (Phase 4 Locked) |
+| **Status** | Aligned with Round 1 Winning Proposal & Verified Phase 1–3 Code |
+| **Author** | Gia (Team Leader & Backend Architect) |
+| **Last Updated** | 2026-11-03 |
+| **Build Commit** | `c7bd8fb` — `main` branch |
 
 ---
 
-## 1. Executive Summary & Solution Context
+# PAGE 1 — System Context & Core Value Proposition
 
-The **NexBuild Cloud Hub** is an edge-optimized logistics orchestration system designed for the Denmark Distribution Hub. In wholesale building supply distribution, physical receiving delays, paperwork discrepancies, and fragmented, country-specific legacy ERP systems create acute inventory latency. Store counter clerks frequently turn away high-value contractors due to stale stock records, even while pallets sit uncatalogued in the receiving yard.
+## 1.1 Executive Summary
 
-NexBuild Cloud Hub solves this through a five-stage automated pipeline:
-$$\text{Scan (OCR)} \longrightarrow \text{Match PO} \longrightarrow \text{Confirm (Discrepancy Mgmt)} \longrightarrow \text{Post Hub} \longrightarrow \text{ATP Lookup}$$
+The **NexBuild Cloud Hub** is an edge-optimised logistics orchestration system designed for Company A's Denmark Distribution Hub. The Round 1 case study identified a critical operational failure: **Phantom Stock** — store counter clerks turn away high-value contractors because their ERP terminals show stale inventory figures, while received pallets sit physically on the receiving dock, uncatalogued for hours. The root cause is the 4–12 hour batch-processing lag in the fragmented, country-specific legacy ERP instance.
 
-### Key Strategic Objectives
-1. **Zero-Latency Available-To-Promise (ATP):** Immediate inventory availability for store counters upon warehouse receipt confirmation, eliminating the typical 4-to-12 hour ERP batch-processing lag.
-2. **AI-Assisted Discrepancy Reconciliation:** Automated optical recognition of unstructured delivery notes with real-time PO reconciliation, flagging shortages, overages, and unknown SKUs with confidence scoring.
-3. **Quarantine Governance for Unordered SKUs:** Strict isolation of uncatalogued or unordered goods (such as `FIX-M8`) into quarantine inventory, preventing unauthorized addition to sellable ATP without purchasing clearance.
-4. **Edge Resilience & Idempotency:** Offline-capable mobile client operations guaranteed by cryptographic idempotency tokens, preventing duplicate postings during intermittent yard Wi-Fi drops.
-5. **Auditability & Traceability:** Immutable logging of employee actions, discrepancy reason codes, and visual photo evidence.
+NexBuild Cloud Hub eliminates this lag through an automated five-stage pipeline:
 
-> **Architectural Assumption (Enterprise ERP):**  
-> As highlighted in our Round 1 case analysis, Company A possesses fragmented, country-specific ERP instances across the Nordics without a unified API standard. For Denmark Phase 1 MVP, we model the system of record as the **Assumed Denmark Legacy ERP (e.g., Microsoft Dynamics 365 / SAP Business One Country ERP Instance)**, interfaced via standard asynchronous REST/OData voucher ingestion.
+```
+Scan (OCR)  →  Match PO  →  Confirm (Discrepancy Mgmt)  →  Post Hub  →  ATP Lookup
+```
+
+The system provides **sub-second ATP freshness** at the store counter the moment a warehouse operator taps "Confirm Receipt" on the mobile scanner — without waiting for the ERP batch cycle.
 
 ---
 
-## 2. C4 Level 1: System Context Diagram
+## 1.2 C4 Level 1 — System Context Diagram
 
-The System Context diagram models the actors, system boundaries, and external platform interactions governing the Denmark Distribution Hub.
+> The following diagram shows every actor, the system boundary, and all external platform interactions for the Denmark Phase 1 MVP.
 
 ```mermaid
 flowchart TD
-    %% Styling
-    classDef actor fill:#e1f5fe,stroke:#0288d1,stroke-width:2px,color:#01579b,font-weight:bold;
-    classDef system fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1b5e20,font-weight:bold;
-    classDef external fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#e65100,font-weight:bold;
+    classDef actor    fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px,color:#1e3a5f,font-weight:bold
+    classDef system   fill:#dcfce7,stroke:#15803d,stroke-width:3px,color:#14532d,font-weight:bold
+    classDef external fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#78350f,font-weight:bold
 
-    %% Actors
-    Staff["Warehouse Staff<br/>(Goods Receiving / Yard Operators)"]:::actor
-    Clerk["Store Counter Clerk<br/>(Sales & Customer Order Fulfillment)"]:::actor
+    WH["Warehouse Operator\n(Mobile Scanner)"]:::actor
+    CC["Store Counter Clerk\n(Desktop Web)"]:::actor
 
-    %% System Boundary
-    Hub["NexBuild Cloud Hub<br/>(Denmark Phase 1 MVP)<br/>[FastAPI & SQLite Engine]"]:::system
+    HUB["NexBuild Cloud Hub MVP\n[FastAPI · SQLite · Python 3.9]"]:::system
 
-    %% External Systems
-    DocAI["Document AI / Vision Service<br/>(Google Gemini Vision / OCR API)"]:::external
-    ERP["Assumed Denmark Legacy ERP<br/>(e.g., Microsoft Dynamics 365 / Country ERP Instance)"]:::external
+    DOCAI["External Document AI Service\n(Google Gemini Vision API)\n[Cloud · HTTPS REST]"]:::external
+    ERP["Assumed Denmark Legacy ERP\n(e.g. Microsoft Dynamics 365)\n[OData v4 · Azure Integ. Services]"]:::external
 
-    %% Relationships
-    Staff -->|"1. Scans delivery notes, reviews discrepancies, confirms goods receipt"| Hub
-    Clerk -->|"5. Queries real-time stock & ATP quantities across aisles"| Hub
-    Hub -->|"2. Dispatches delivery note image/payload for OCR extraction"| DocAI
-    DocAI -->|"3. Returns raw item lines, quantities, and confidence scores"| Hub
-    Hub -->|"4. Synchronizes committed goods receipt vouchers & subledger entries"| ERP
+    WH  -->|"1  Scans paper delivery note &\n    confirms discrepancies\n    HTTPS / JSON"| HUB
+    HUB -->|"2  Sends delivery note image\n    for OCR extraction\n    HTTPS / Multipart"| DOCAI
+    DOCAI -->|"3  Returns structured line items\n    + confidence scores\n    HTTPS / JSON"| HUB
+    HUB -->|"4  Posts goods receipt voucher\n    to inventory subledger\n    Async / OData v4"| ERP
+    CC  -->|"5  Queries real-time ATP stock\n    for contractor walk-ins\n    HTTPS / JSON"| HUB
 
-    %% Context boundaries
-    subgraph Denmark_Distribution_Facility ["Denmark Hub Facility Boundary"]
-        Staff
-        Clerk
-        Hub
+    subgraph facility["Denmark Distribution Hub Facility Boundary"]
+        WH
+        CC
+        HUB
     end
 
-    subgraph Enterprise_Cloud ["Enterprise Cloud & External Services"]
-        DocAI
+    subgraph cloud["Enterprise Cloud & External Services"]
+        DOCAI
         ERP
     end
 ```
 
-### Context Boundary Descriptions
-- **Warehouse Staff:** Operates mobile scanner devices in receiving docks and timber yards to capture delivery notes, inspect shipments, and resolve supplier line discrepancies.
-- **Store Counter Clerk:** Uses counter terminal workstations to query real-time Available-to-Promise stock, reserve goods for immediate walk-in contractors, and verify bin locations.
-- **NexBuild Cloud Hub:** High-performance local edge server maintaining operational tables, local ATP cache, OCR matching engine, and idempotency control.
-- **Document AI / Vision Service:** Cloud multimodal vision service (Gemini 2.5 / Document AI) transforming delivery note photographs into structured item schemas.
-- **Assumed Denmark Legacy ERP:** Representative Danish enterprise ERP instance (e.g., Microsoft Dynamics 365) maintaining General Ledger accounting, centralized procurement, and financial voucher records.
-
 ---
 
-## 3. C4 Level 2: Container Diagram
+## 1.3 How This Solves the "Phantom Stock" Problem
 
-The Container diagram details the high-level technical architecture, internal subsystems, and communications protocols inside the NexBuild Cloud Hub.
+| Legacy Pain Point | NexBuild Cloud Hub Solution |
+|:--|:--|
+| **4–12 h ERP batch lag** — store counters see yesterday's stock | Local `inventory_hub` table updated **instantly** on receipt confirmation; ATP is live before the ERP batch even begins |
+| **Manual paper data entry** — human transcription errors inflate discrepancies | AI OCR (`ai_ocr_service.py`) digitises delivery notes and auto-reconciles 14 PO lines in milliseconds |
+| **No discrepancy workflow** — shortfalls or unknown items silently enter sellable stock | `matching_engine.py` assigns `OK / SHORT / OVER / UNKNOWN_SKU` with confidence scores; unordered items are **quarantined** |
+| **Double-counting under poor Wi-Fi** — retry storms in steel-reinforced receiving yards | Every POST carries a client-generated `idempotency_key`; server-side guard in `receipt_transactions` prevents duplicate postings |
+| **Zero audit trail** — no photo evidence or reason codes | `audit_logs` captures `employee_id`, `action`, `reason_code`, `photo_evidence` on every line update |
+
+> **Enterprise ERP Assumption:** Company A runs fragmented, country-specific ERP instances across the Nordics with no unified API standard. For Phase 1 we model the system of record as the **Assumed Denmark Legacy ERP (e.g., Microsoft Dynamics 365 / SAP Business One Country ERP Instance)**, interfaced via `mock_erp_adapter.py` which simulates REST/OData voucher ingestion.
+
+---
+---
+
+# PAGE 2 — Container Architecture & Key Design Decisions
+
+## 2.1 C4 Level 2 — Container Diagram
+
+> This diagram shows the internal layout of the NexBuild Cloud Hub MVP as implemented in Phase 1–3 source code.
 
 ```mermaid
 flowchart TD
-    %% Styling
-    classDef client fill:#e0f2f1,stroke:#00796b,stroke-width:2px,color:#004d40;
-    classDef container fill:#ede7f6,stroke:#512da8,stroke-width:2px,color:#311b92;
-    classDef storage fill:#fbe9e7,stroke:#d84315,stroke-width:2px,color:#bf360c;
-    classDef external fill:#eceff1,stroke:#455a64,stroke-width:2px,color:#263238;
+    classDef client   fill:#e0f2f1,stroke:#0f766e,stroke-width:2px,color:#134e4a
+    classDef api      fill:#ede9fe,stroke:#6d28d9,stroke-width:2px,color:#2e1065
+    classDef service  fill:#f0f9ff,stroke:#0369a1,stroke-width:2px,color:#0c4a6e
+    classDef store    fill:#fff7ed,stroke:#c2410c,stroke-width:2px,color:#7c2d12
+    classDef external fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
 
-    %% Clients
-    WebUI["Mobile & Desktop Web UI<br/>(PWA / HTML5 / JS Client)<br/>[Client Browser]"]:::client
+    FE["Responsive Web App\nScanner UI · Counter UI\n[HTML5 / JS — /frontend/]"]:::client
 
-    %% Backend Container
-    subgraph CloudHubContainer ["NexBuild Backend Application Container (FastAPI)"]
-        API["REST API Router<br/>(/api/v1/*)<br/>[FastAPI / Starlette]"]:::container
-        OCRService["AI OCR Service Adapter<br/>(Mock Fallback / Gemini Client)<br/>[Python Module]"]:::container
-        MatchEngine["PO Matching Engine<br/>(Variance & Confidence Scoring)<br/>[Python Service]"]:::container
-        TxManager["Idempotency & Transaction Manager<br/>(Offline Protection & Ledger Update)<br/>[Python Service]"]:::container
-        ERPAdapter["Mock ERP Adapter<br/>(Assumed Denmark Legacy ERP Synchronizer)<br/>[Python Adapter]"]:::container
+    subgraph backend["NexBuild Backend Application Container  (backend/)  [FastAPI · Python 3.9]"]
+        RT["REST API Router\n/api/v1/*\nmain.py"]:::api
+
+        subgraph pipeline["Receive Pipeline"]
+            OCR["AI OCR Service\nextract_delivery_note()\nai_ocr_service.py"]:::service
+            ME["PO Matching Engine\nreconcile_scanned_items()\nmatching_engine.py"]:::service
+        end
+
+        subgraph confirm["Confirm & Post Pipeline"]
+            IG["Idempotency Guard\nreceipt_transactions lookup\nmain.py · confirm_receipt()"]:::service
+            QG["Quarantine Gate\nUNKNOWN_SKU → quarantine_qty\nmain.py · confirm_receipt()"]:::service
+            EA["Mock ERP Adapter\nsync_to_denmark_erp()\nmock_erp_adapter.py"]:::service
+        end
     end
 
-    %% Storage Container
-    subgraph DatabaseContainer ["Local Storage Container"]
-        DB[("SQLite Database<br/>(nexbuild.db)<br/>[WAL Mode / PRAGMA FK]"]:::storage
-        PO_Tables["po_headers & po_lines"]:::storage
-        Inv_Table["inventory_hub<br/>(physical_on_hand, quarantine_qty, atp_qty)"]:::storage
-        Audit_Table["audit_logs<br/>(employee_id, reason, photo)"]:::storage
-        Tx_Table["receipt_transactions<br/>(idempotency_key registry)"]:::storage
+    subgraph db["Local Storage Container  (nexbuild.db)  [SQLite]"]
+        T1[("po_headers\npo_lines")]:::store
+        T2[("inventory_hub\nphysical_on_hand\nquarantine_qty · atp_qty")]:::store
+        T3[("receipt_transactions\nidempotency_key registry\nerp_voucher_no")]:::store
+        T4[("audit_logs\nemployee_id · action\nreason_code · photo_evidence")]:::store
     end
 
-    %% External
-    ExtCloud["Cloud Vision Service<br/>(Gemini Vision API)"]:::external
-    CentralERP["Assumed Denmark Legacy ERP<br/>(Dynamics 365 / Country ERP Instance)"]:::external
+    DOCAI["Google Gemini Vision API\n[Cloud · HTTPS]"]:::external
+    ERP["Assumed Denmark Legacy ERP\nDynamics 365 / OData v4\nGL-DK-2100-INVENTORY-RECEIVING"]:::external
 
-    %% Connections
-    WebUI -->|"HTTPS / JSON REST<br/>Port 8000"| API
-    API -->|"Invokes OCR parsing"| OCRService
-    OCRService -.->|"HTTPS / REST"| ExtCloud
-    OCRService -->|"Returns parsed lines"| MatchEngine
-    API -->|"Reads PO details"| MatchEngine
-    MatchEngine -->|"Reconciles lines"| API
+    %% Frontend → API
+    FE  -->|"HTTPS / JSON\nPort 8000"| RT
 
-    API -->|"Submits confirmed receipt"| TxManager
-    TxManager -->|"Verifies idempotency_key"| Tx_Table
-    TxManager -->|"Updates physical, quarantine & ATP stock"| Inv_Table
-    TxManager -->|"Appends immutable audit entries"| Audit_Table
-    TxManager -->|"Updates PO completion state"| PO_Tables
+    %% Scan pipeline
+    RT  -->|"Invoke OCR"| OCR
+    OCR -..->|"HTTPS Multipart\n(graceful fallback to\ndeterministic mock)"| DOCAI
+    OCR -->|"14 scanned lines\n+ confidence scores"| ME
+    ME  -->|"Reconciled items\n+ summary stats"| RT
 
-    TxManager -->|"Triggers outbound sync"| ERPAdapter
-    ERPAdapter -.->|"HTTPS / OData v4"| CentralERP
+    %% Confirm pipeline
+    RT  -->|"POST confirm-receipt"| IG
+    IG  -->|"idempotency_key check"| T3
+    IG  -->|"New tx: route each line"| QG
+    QG  -->|"UNKNOWN_SKU:\nquarantine_qty +="| T2
+    QG  -->|"Valid PO item:\nphysical_on_hand += atp_qty +="| T2
+    QG  -->|"Write audit record"| T4
+    QG  -->|"Update received_qty\n& PO status"| T1
+    IG  -->|"Trigger ERP sync"| EA
+    EA  -..->|"OData v4 voucher\nDK-ERP-GR-2026-*\n(mock)"| ERP
+    IG  -->|"Seal idempotency_key\n+ erp_voucher_no"| T3
 
-    API -->|"Queries real-time ATP"| Inv_Table
-
-    DB --- PO_Tables
-    DB --- Inv_Table
-    DB --- Audit_Table
-    DB --- Tx_Table
+    %% ATP read path
+    RT  -->|"GET /inventory/atp"| T2
 ```
 
 ---
 
-## 4. Subsystem Deep-Dive & Engineering Rationale
+## 2.2 Key Architectural Decisions
 
-### 4.1. Mathematical Formula for Inventory Transitions & Available-To-Promise (ATP)
+### Decision 1 — Offline Resilience & Idempotency
 
-To avoid inventory double-counting between inbound stock and physical inventory, NexBuild Cloud Hub implements an exact **two-step state transition model**:
+**Problem:** Steel-reinforced receiving yard zones cause frequent Wi-Fi drops mid-transaction. Without protection, a mobile retry would POST `confirm-receipt` twice, double-counting 80 bags of `CEM-25` into sellable ATP.
 
-#### Step 1: Goods Receipt Posting (Phase 1 Denmark MVP)
-When warehouse operators confirm a delivery note, verified line items update physical warehouse stock:
-$$\text{Physical On-Hand}_{\text{new}} = \text{Physical On-Hand}_{\text{current}} + \text{Confirmed Received Qty (excluding quarantined/unordered items)}$$
+**Solution implemented in `main.py → confirm_receipt()`:**
 
-- **Verified PO Items:** Received quantities of ordered SKUs (`CEM-25: +80`, `TIM-4595: +40`, `PLAST-01: +52`) increment `Physical On-Hand`.
-- **Unordered / Unknown SKUs:** Goods not present on the Purchase Order (e.g., `FIX-M8: 12 units` with low confidence $0.68$) are **excluded** from `Physical On-Hand` and routed to `Quarantine Qty`. They do not enter sellable stock without an explicit purchasing override (`reason_code == "accept_unordered_override"`).
+```
+Client                           Server
+  │                                │
+  │── POST /confirm-receipt ───────►│
+  │   {idempotency_key: "uuid-A"}  │  1. CHECK receipt_transactions
+  │                                │     WHERE idempotency_key = "uuid-A"
+  │                                │  2. NOT FOUND → execute full pipeline
+  │                                │     → write inventory, audit, ERP sync
+  │                                │     → INSERT receipt_transactions (key="uuid-A",
+  │                                │       erp_voucher_no, response_json)
+  │◄── 200 {is_idempotent_replay: false} ─│
+  │                                │
+  │   [Wi-Fi drops, client retries]│
+  │                                │
+  │── POST /confirm-receipt ───────►│
+  │   {idempotency_key: "uuid-A"}  │  1. CHECK receipt_transactions
+  │                                │     FOUND → return cached response_json
+  │◄── 200 {is_idempotent_replay: true} ─│
+  │   [inventory untouched]        │
+```
 
-#### Step 2: Available-to-Promise (ATP) Calculation
-Available-to-Promise measures sellable inventory free from commercial commitments:
+> **Result:** Zero duplicate inventory entries. Verified by `test_idempotent_receipt_replay` in the regression suite.
+
+---
+
+### Decision 2 — Data Governance: Quarantine vs. ATP
+
+**Problem:** Supplier `Nordic BuildSupply DK` delivered 12 boxes of `FIX-M8` (Fixings M8) that were **not on PO-48213**. Automatically adding these to sellable ATP would violate purchasing controls and distort financial subledgers.
+
+**Three-column separation in `inventory_hub`:**
+
+```
+Column              FIX-M8 (before)   After confirm-receipt
+─────────────────   ───────────────   ─────────────────────
+physical_on_hand        10.0              10.0   ← UNCHANGED
+atp_qty                 10.0              10.0   ← UNCHANGED
+quarantine_qty           0.0              12.0   ← incremented only
+```
+
+**Logic path in `main.py → confirm_receipt()`:**
+
+| Condition | Path |
+|:--|:--|
+| `match_status == "UNKNOWN_SKU"` **OR** `reason_code in ("unordered_quarantine", "not_on_po")` **AND** SKU not on PO | → **Quarantine Gate**: `quarantine_qty += received_qty`. `physical_on_hand` and `atp_qty` untouched |
+| `reason_code == "accept_unordered_override"` | → Supervisor override; item accepted into `physical_on_hand` and `atp_qty` |
+| Valid PO line (`CEM-25`, `TIM-4595`, `PLAST-01`, …) | → Normal receipt: `physical_on_hand += received_qty`, `atp_qty += received_qty` |
+
+**ERP GL routing in `mock_erp_adapter.py`:**
+- PO items → `GL-DK-2100-INVENTORY-RECEIVING` (sellable subledger)
+- Quarantined items → `GL-DK-9900-QUARANTINE-HOLD` (pending clearance)
+
+> **Verified stock after PO-48213 confirmation:**  
+> CEM-25: 120 → **200** (+80) | TIM-4595: 85 → **125** (+40) | PLAST-01: 30 → **82** (+52) | FIX-M8 ATP: **10** (unchanged, quarantine=12)
+
+---
+
+### Decision 3 — Two-Step ATP Math Model (Phase 1 Denmark MVP)
+
+To prevent double-counting, confirmed inbound receipts update `physical_on_hand` first; ATP is then derived, not stored separately as a running tally of inbound forecasts.
+
+**Step 1 — Goods Receipt Posting:**
+
+$$\text{Physical On-Hand}_{\text{new}} = \text{Physical On-Hand}_{\text{current}} + \text{Confirmed Received Qty}$$
+
+> *Only verified PO items are included. Quarantined/unordered items (e.g. FIX-M8) are explicitly excluded from this calculation.*
+
+**Step 2 — Available-to-Promise Calculation:**
+
 $$\text{ATP} = \text{Physical On-Hand} - \text{Reserved (Soft-Locked) Qty} - \text{Committed Outbound Qty}$$
 
-*Architectural Roadmap Alignment:*
-- **Phase 1 (Denmark MVP):** $\text{Reserved} = 0$ and $\text{Committed} = 0$. Consequently, sellable $\text{ATP} = \text{Physical On-Hand}$ for verified items.
-- **Phase 2 (Norway Rollout):** Introduces **Soft-Lock Reservations** ($\text{Reserved} > 0$) for in-flight contractor telephone orders holding stock for 60 minutes.
-- **Phase 3 (Sweden Rollout):** Introduces **Committed Outbound Allocations** ($\text{Committed} > 0$) for automated multi-site depot transfers.
+**Phase roadmap for Reserved and Committed quantities:**
+
+| Phase | Market | Reserved | Committed | ATP Formula simplifies to |
+|:--|:--|:--|:--|:--|
+| **Phase 1** | 🇩🇰 Denmark MVP | `0` | `0` | `ATP = Physical On-Hand` |
+| **Phase 2** | 🇳🇴 Norway Rollout | `> 0` (60-min soft-lock for phone orders) | `0` | `ATP = Physical − Reserved` |
+| **Phase 3** | 🇸🇪 Sweden Rollout | `> 0` | `> 0` (multi-site depot transfers) | `ATP = Physical − Reserved − Committed` |
+
+> **Why not store ATP directly?** Storing ATP as a derived column avoids the classic double-counting bug where inbound confirmed receipts are added to both `physical_on_hand` AND a separate `confirmed_inbound` ATP field. Our model enforces a single source of truth: **physical_on_hand** is the only quantity that receipt posting writes to.
 
 ---
 
-### 4.2. Offline Idempotency Architecture
-Distribution hubs experience frequent Wi-Fi dead zones in steel-reinforced yard zones. To ensure operations continue unhindered:
-1. Every client transaction generates a deterministic client-side UUIDv4 `idempotency_key` prior to network dispatch.
-2. The `POST /api/v1/confirm-receipt` endpoint checks `receipt_transactions` before executing any writes.
-3. If a network timeout caused the client to retry a request that already succeeded on the server, the server detects the existing `idempotency_key` and returns the cached confirmation with `is_idempotent_replay: true`.
-4. **Result:** Zero double-counting of physical stock or ERP entries, even under severe packet loss.
+## 2.3 Matching Engine — Confidence Scoring Rules
+
+When `ai_ocr_service.extract_delivery_note()` returns the 14 scanned lines, `matching_engine.reconcile_scanned_items()` applies the following deterministic business rules:
+
+| Status | Condition | Confidence | `requires_review` | Example |
+|:--|:--|:--|:--|:--|
+| **`OK`** | `received == ordered` | `0.98` | `False` | CEM-25: 80/80 |
+| **`SHORT`** | `received < ordered` | `0.96` | `True` | PLAST-01: 52/60 (deficit -8) |
+| **`OVER`** | `received > ordered` | `0.95` | `True` | *(none in demo)* |
+| **`UNKNOWN_SKU`** | SKU not in `po_lines` | `0.68` | `True` | FIX-M8: 12 boxes (not on PO) |
+
+> FIX-M8's confidence of `0.68` explicitly signals low OCR certainty — it may be a mis-scanned barcode for a legitimate PO item, reinforcing the need for quarantine review rather than automatic acceptance.
 
 ---
 
-### 4.3. Automated Discrepancy Matching & Confidence Rules
-When OCR extracts delivery note items, the `matching_engine` evaluates:
-- **`OK`**: Scanned quantity equals ordered quantity ($Q_{\text{rcv}} = Q_{\text{ord}}$). `requires_review = false`.
-- **`SHORT`**: Partial shipment ($Q_{\text{rcv}} < Q_{\text{ord}}$). Requires warehouse supervisor override and mandatory reason code (`SUPPLIER_SHORT_SHIP`, `DAMAGED_IN_TRANSIT`).
-- **`OVER`**: Excess shipment ($Q_{\text{rcv}} > Q_{\text{ord}}$). Requires approval and reason code.
-- **`UNKNOWN_SKU`**: Item detected on the delivery note that does not exist in the Purchase Order. Assigned a conservative low confidence score (e.g. $0.68$ for `FIX-M8`) and flagged for quarantine review.
+## 2.4 REST API Interface Contract
+
+All endpoints use the `/api/v1/` prefix, `snake_case` JSON keys, and Pydantic v2 schema validation.
+
+| Method | Endpoint | Produces | Primary Consumer |
+|:--|:--|:--|:--|
+| `GET` | `/api/v1/health` | `{status: "ok", active_ocr_mode}` | Monitoring / Load Balancer |
+| `GET` | `/api/v1/po/{po_number}` | `POHeaderResponse` (14 lines) | Scanner UI — pre-populate expected quantities |
+| `POST` | `/api/v1/scan-delivery-note` | `ScanDeliveryNoteResponse` | Mobile camera capture / barcode scanner |
+| `POST` | `/api/v1/confirm-receipt` | `ReceiptTransactionResponse` | Warehouse operator confirmation screen |
+| `GET` | `/api/v1/inventory/atp` | `InventoryATPResponse` (trust_status: GREEN/AMBER/RED) | Store Counter ATP portal |
+| `GET` | `/api/v1/audit-logs` | Audit log array | Compliance officer / QA lead |
+| `POST` | `/api/v1/reset-demo` | `ResetDemoResponse` | Demo administration / QA test harness |
+
+**Trust Status thresholds** (computed at query time from `inventory_hub.last_updated`):
+- **GREEN** — updated within 15 minutes
+- **AMBER** — updated within 2 hours
+- **RED** — stale beyond 2 hours
 
 ---
 
-### 4.4. Compliance & Auditability
-Every stock adjustment writes to `audit_logs` containing:
-- **`employee_id`**: Badge identifier of receiving warehouse operator.
-- **`action`**: Classification (`GOODS_RECEIPT_CONFIRMED`, `QUARANTINED_UNORDERED_SKU`, `GOODS_RECEIPT_OVERRIDE_ACCEPTED`).
-- **`reason_code`**: Standardized industry code explaining variances.
-- **`photo_evidence`**: URI/Base64 pointer to photographic documentation of damaged packaging or shipping manifests.
-- **`timestamp`**: UTC ISO-8601 millisecond timestamp.
+## 2.5 Auditability & Compliance
+
+Every inventory state change writes an immutable record to `audit_logs`:
+
+| Column | Description | Example |
+|:--|:--|:--|
+| `employee_id` | Warehouse operator badge ID | `EMP-9021` |
+| `store_id` | Distribution hub identifier | `DK-Aarhus-01` |
+| `po_number` | PO being received | `PO-48213` |
+| `sku_code` | Canonical SKU | `FIX-M8` |
+| `action` | Classified event type | `QUARANTINED_UNORDERED_SKU` |
+| `reason_code` | Standardised variance code | `unordered_quarantine` |
+| `quantity_change` | Units affected | `12.0` |
+| `photo_evidence` | URI/Base64 to photographic documentation | *(optional)* |
+| `details` | Free-text machine-readable detail | `QUARANTINED_UNORDERED_SKU: sku=FIX-M8 qty=12.0` |
+| `timestamp` | UTC ISO-8601 | `2026-11-03T15:12:04.000Z` |
 
 ---
 
-## 5. Interface Specifications & Data Contracts
-
-| Method | Endpoint | Description | Primary Consumer |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/api/v1/po/{po_number}` | Returns PO header & 14 line items | Goods In Scanner UI |
-| `POST` | `/api/v1/scan-delivery-note` | Executes OCR & PO variance matching | Mobile Camera / Scanner |
-| `POST` | `/api/v1/confirm-receipt` | Idempotent receipt confirmation, quarantine & stock posting | Mobile Confirmation UI |
-| `GET` | `/api/v1/inventory/atp` | Real-time Available-to-Promise stock | Store Counter Portal |
-| `POST` | `/api/v1/reset-demo` | Truncates & reseeds baseline demo state | Demo & QA Test Runner |
-| `GET` | `/api/v1/audit-logs` | Inspection log of goods receiving actions | Compliance & QA Auditor |
-
----
-
-*Authored by Gia (Team Leader & Backend Architect) for NexBuild Cloud Hub Round 2 MVP.*
+*Authored by Gia (Team Leader & Backend Architect) · NexBuild Cloud Hub · Round 2 Build-a-thon · Netcompany IT Consultant Challenge 2026*
