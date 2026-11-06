@@ -97,6 +97,9 @@
     // FIX-M8 State
     fixApproved: false,
 
+    // Dynamic exception tracking across all SKUs
+    reviewedExceptions: {},
+
     // Active bottom sheet modal
     activeSheet: null, // null | "PLAST_SHEET" | "DUPLICATE_RESULT"
     lastTriggerElement: null,
@@ -193,9 +196,29 @@
       }
 
       state.scanResult = result;
+      const rawLines = result.lines || result.items || [];
+      const plastLine = rawLines.find((l) => l.sku_code === "PLAST-01");
+      if (plastLine && plastLine.match_status === "SHORT") {
+        state.plastReview.reviewed = false;
+        state.plastReview.received_qty = plastLine.received_qty;
+      } else {
+        state.plastReview.reviewed = true;
+      }
+      const fixLine = rawLines.find((l) => l.sku_code === "FIX-M8");
+      if (fixLine && fixLine.match_status === "UNKNOWN_SKU") {
+        state.fixApproved = false;
+      } else {
+        state.fixApproved = true;
+      }
+      state.reviewedExceptions = {};
+      if (state.plastReview.reviewed) state.reviewedExceptions["PLAST-01"] = true;
+      if (state.fixApproved) state.reviewedExceptions["FIX-M8"] = true;
+
       state.step = 2;
       state.isScanning = false;
-      state.activeCaption = "Plasterboard is short by 8: reason and photo are logged";
+      state.activeCaption = plastLine && plastLine.match_status === "SHORT" 
+        ? "Plasterboard is short: reason and photo are logged"
+        : "Reconciliation complete — review matched lines below";
 
       // Haptics on scan complete
       if (Fx.vibrateScanComplete) Fx.vibrateScanComplete();
@@ -222,6 +245,84 @@
       state.errorMessage = err.message || "Network / OCR error occurred. Please try again.";
       if (Fx.vibrateError) Fx.vibrateError();
       addEventLog(`Scan failed: ${err.message}`, "error");
+      render();
+    }
+  }
+
+  /**
+   * Real AI OCR scan — sends an actual image file to the backend Gemini Vision endpoint.
+   * Falls back gracefully to the demo mock if the API key is missing or AI fails.
+   */
+  async function triggerRealScan(file) {
+    if (state.isScanning || !file) return;
+    state.isScanning = true;
+    state.errorMessage = null;
+    state.scanProgressText = "Uploading image to NexBuild AI OCR...";
+    state.activeCaption = "Real AI reads your delivery note and matches it to PO-48213";
+    render();
+
+    const t1 = setTimeout(() => {
+      state.scanProgressText = "Processing with Gemini 1.5 Flash Vision... (3-5s)";
+      render();
+    }, 800);
+
+    const t2 = setTimeout(() => {
+      state.scanProgressText = "Extracting line items & matching SKU catalog...";
+      render();
+    }, 2500);
+
+    try {
+      const result = await window.Api.scanDeliveryNote(DEFAULT_PO, file);
+      clearTimeout(t1);
+      clearTimeout(t2);
+
+      if (result.status === "error") {
+        throw new Error(result.message || "AI OCR failed");
+      }
+
+      state.scanResult = result;
+      const rawLines = result.lines || result.items || [];
+      const plastLine = rawLines.find((l) => l.sku_code === "PLAST-01");
+      if (plastLine && plastLine.match_status === "SHORT") {
+        state.plastReview.reviewed = false;
+        state.plastReview.received_qty = plastLine.received_qty;
+      } else {
+        state.plastReview.reviewed = true;
+      }
+      const fixLine = rawLines.find((l) => l.sku_code === "FIX-M8");
+      if (fixLine && fixLine.match_status === "UNKNOWN_SKU") {
+        state.fixApproved = false;
+      } else {
+        state.fixApproved = true;
+      }
+      state.reviewedExceptions = {};
+      if (state.plastReview.reviewed) state.reviewedExceptions["PLAST-01"] = true;
+      if (state.fixApproved) state.reviewedExceptions["FIX-M8"] = true;
+
+      state.step = 2;
+      state.isScanning = false;
+      state.activeCaption = "AI scan complete — review matched lines below";
+
+      if (Fx.vibrateScanComplete) Fx.vibrateScanComplete();
+      addEventLog("Real AI OCR scan complete", "success");
+      render();
+
+      setTimeout(() => {
+        document.querySelectorAll("[data-count-target]").forEach((el) => {
+          const target = parseFloat(el.getAttribute("data-count-target"));
+          if (!isNaN(target) && Fx.animateCountUp) {
+            Fx.animateCountUp(el, target, 250);
+          }
+        });
+      }, 50);
+
+    } catch (err) {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      state.isScanning = false;
+      state.errorMessage = err.message || "AI OCR error. Please try again or use demo scan.";
+      if (Fx.vibrateError) Fx.vibrateError();
+      addEventLog(`Real AI scan failed: ${err.message}`, "error");
       render();
     }
   }
@@ -264,6 +365,9 @@
     state.plastReview.has_photo = state.plastDraft.has_photo;
     state.plastReview.notes = state.plastDraft.notes;
 
+    state.reviewedExceptions = state.reviewedExceptions || {};
+    state.reviewedExceptions["PLAST-01"] = true;
+
     closeActiveSheet();
     showToast("PLAST-01 exception saved (-8 short)");
     addEventLog(t("eventPlastReviewed"), "warning");
@@ -280,6 +384,8 @@
 
   function toggleFixApproved() {
     state.fixApproved = !state.fixApproved;
+    state.reviewedExceptions = state.reviewedExceptions || {};
+    state.reviewedExceptions["FIX-M8"] = state.fixApproved;
     state.activeCaption = "Unknown item goes to quarantine, not sellable stock";
     render();
 
@@ -304,19 +410,19 @@
     const rawLines = state.scanResult.lines || state.scanResult.items || [];
 
     const confirmedLines = rawLines.map((l) => {
-      if (l.sku_code === "PLAST-01") {
+      if (l.sku_code === "PLAST-01" && l.match_status === "SHORT") {
         return {
           sku_code: "PLAST-01",
-          received_qty: parseFloat(state.plastReview.received_qty),
+          received_qty: parseFloat(state.plastReview.received_qty || l.received_qty),
           unit: l.unit || "sheets",
           match_status: "SHORT",
-          reason_code: state.plastReview.reason_code,
+          reason_code: state.plastReview.reason_code || "supplier_shortage",
           photo_evidence: state.plastReview.photo_evidence,
           notes: state.plastReview.notes || "Short delivery documented with photo evidence",
         };
       }
 
-      if (l.sku_code === "FIX-M8") {
+      if (l.sku_code === "FIX-M8" && l.match_status === "UNKNOWN_SKU") {
         return {
           sku_code: "FIX-M8",
           received_qty: parseFloat(l.received_qty || 12.0),
@@ -330,14 +436,15 @@
         };
       }
 
+      const isReviewed = Boolean(state.reviewedExceptions && state.reviewedExceptions[l.sku_code]);
       return {
         sku_code: l.sku_code,
         received_qty: parseFloat(l.received_qty),
         unit: l.unit || "pcs",
         match_status: l.match_status || "OK",
-        reason_code: "NORMAL_GOODS_RECEIPT",
+        reason_code: l.match_status === "SHORT" ? "supplier_shortage" : l.match_status === "OVER" ? "supplier_overdelivery" : "NORMAL_GOODS_RECEIPT",
         photo_evidence: null,
-        notes: null,
+        notes: isReviewed ? "Discrepancy acknowledged by receiver" : null,
       };
     });
 
@@ -353,8 +460,20 @@
   async function confirmCurrentReceipt() {
     if (state.confirming) return;
 
-    if (!state.plastReview.reviewed || !state.fixApproved) {
-      showToast(t("guideReviewBoth"));
+    const rawLines = state.scanResult ? (state.scanResult.lines || state.scanResult.items || []) : [];
+    
+    // Check all unresolved discrepancies across the entire payload
+    const unresolvedDiscrepancies = rawLines.filter((l) => {
+      const isDisc = l.match_status !== "OK" || (l.ordered_qty !== undefined && l.received_qty !== l.ordered_qty);
+      if (!isDisc) return false;
+      if (l.sku_code === "PLAST-01") return !state.plastReview.reviewed;
+      if (l.sku_code === "FIX-M8") return !state.fixApproved;
+      return !Boolean(state.reviewedExceptions && state.reviewedExceptions[l.sku_code]);
+    });
+
+    if (unresolvedDiscrepancies.length > 0) {
+      const skuList = unresolvedDiscrepancies.map((l) => l.sku_code).join(", ");
+      showToast(`Please review discrepancy for: ${skuList}`);
       return;
     }
 
@@ -525,6 +644,7 @@
         notes: "Pallet layer missing 8 sheets. Verified at receiving dock.",
       };
       state.fixApproved = false;
+      state.reviewedExceptions = {};
       state.lastConfirmedPayload = null;
       state.lastConfirmedKey = null;
       state.lastTransactionResult = null;
@@ -928,6 +1048,16 @@
               <!-- Requirement A: Shorter label, PO code above, never wraps -->
               <span class="whitespace-nowrap">${t("scanDemoButton")}</span>
             </button>
+
+            <!-- Real AI OCR: Upload / Camera button -->
+            <button id="btn-upload-scan" type="button"
+              class="w-full min-h-[48px] py-3 px-6 mt-3 bg-slate-700 hover:bg-slate-600 active:scale-98 text-white font-semibold text-sm rounded-xl shadow flex items-center justify-center gap-2 transition cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 border border-slate-600">
+              <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+              <span class="whitespace-nowrap">📷 Upload Real Photo (AI OCR)</span>
+            </button>
           </div>
 
           <!-- Instructions Card -->
@@ -962,55 +1092,31 @@
 
   function renderStatusBadge(status) {
     if (status === "OK") {
-      return `
-        <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-          <svg class="w-3.5 h-3.5 text-emerald-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/>
-          </svg>
-          <span>${t("statusOk")}</span>
-        </span>
-      `;
+      return `<span class="bg-green-100 text-green-800 px-2.5 py-1 rounded-md text-xs font-bold border border-green-200 whitespace-nowrap">100% matched</span>`;
     }
-
     if (status === "SHORT") {
-      return `
-        <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">
-          <svg class="w-3.5 h-3.5 text-amber-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-          </svg>
-          <span>${t("statusShort")}</span>
-        </span>
-      `;
+      return `<span class="bg-yellow-100 text-yellow-800 px-2.5 py-1 rounded-md text-xs font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>`;
     }
-
     if (status === "UNKNOWN_SKU") {
-      return `
-        <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-red-100 text-red-900 border border-red-300">
-          <svg class="w-3.5 h-3.5 text-red-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/>
-          </svg>
-          <span>${t("statusUnknown")}</span>
-        </span>
-      `;
+      return `<span class="bg-red-100 text-red-800 px-2.5 py-1 rounded-md text-xs font-bold border border-red-200 whitespace-nowrap">UNORDERED SKU</span>`;
     }
-
-    return `
-      <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-slate-100 text-slate-700">
-        ${status}
-      </span>
-    `;
+    if (status === "OVER") {
+      return `<span class="bg-blue-100 text-blue-800 px-2.5 py-1 rounded-md text-xs font-bold border border-blue-200 whitespace-nowrap">OVER</span>`;
+    }
+    return `<span class="bg-slate-100 text-slate-800 px-2.5 py-1 rounded-md text-xs font-bold border border-slate-200 whitespace-nowrap">${status || "PENDING"}</span>`;
   }
 
   function renderSpotlightCard(line) {
-    const isPlast = line.sku_code === "PLAST-01";
-    const isFix = line.sku_code === "FIX-M8";
+    const isPlastShort = line.sku_code === "PLAST-01" && line.match_status === "SHORT";
+    const isFixUnknown = line.sku_code === "FIX-M8" && line.match_status === "UNKNOWN_SKU";
     const confPercent = Math.round((line.confidence_score || 0.98) * 100);
 
-    // 1. PLAST-01 Card
-    if (isPlast) {
+    // 1. PLAST-01 Short Delivery Card (Only if actually short)
+    if (isPlastShort) {
       const isReviewed = state.plastReview.reviewed;
-      const recQty = state.plastReview.received_qty;
-      const shortfall = recQty - 60; // -8
+      const recQty = state.plastReview.received_qty !== undefined ? state.plastReview.received_qty : line.received_qty;
+      const ordQty = line.ordered_qty || 60;
+      const shortfall = recQty - ordQty;
 
       return `
         <article class="rounded-xl border ${isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-amber-300 bg-amber-50/30"
@@ -1020,11 +1126,11 @@
               <h4 class="font-bold text-sm text-slate-900 leading-snug">${line.item_name}</h4>
               <div class="flex items-center gap-2 mt-0.5">
                 <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">PLAST-01</span>
-                <span class="text-[11px] text-slate-500">sheets</span>
+                <span class="text-[11px] text-slate-500">${line.unit || 'sheets'}</span>
               </div>
             </div>
             <div class="shrink-0">
-              ${renderStatusBadge("SHORT")}
+              <span class="bg-yellow-100 text-yellow-800 px-2.5 py-1 rounded-md text-xs font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>
             </div>
           </div>
 
@@ -1034,11 +1140,11 @@
               <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider block">${t("deliveredOrdered")}</span>
               <div class="flex items-baseline gap-1 mt-0.5">
                 <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="${recQty}">${recQty}</span>
-                <span class="text-xs font-semibold text-slate-500">/ 60 sheets</span>
+                <span class="text-xs font-semibold text-slate-500">/ ${ordQty} ${line.unit || 'sheets'}</span>
               </div>
             </div>
-            <span class="px-2 py-1 rounded-md text-xs font-black bg-amber-200/90 text-amber-900 border border-amber-300 whitespace-nowrap">
-              ${t("shortDeficitChip", { count: shortfall })}
+            <span class="px-2 py-1 rounded-md text-xs font-black bg-yellow-100 text-yellow-900 border border-yellow-300 whitespace-nowrap">
+              ${shortfall} ${line.unit || 'sheets'} short
             </span>
           </div>
 
@@ -1046,11 +1152,11 @@
           <div class="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
             <div class="flex items-center gap-1.5 flex-1 mr-3">
               <div class="w-16 h-1.5 rounded-full bg-slate-200 overflow-hidden shrink-0">
-                <div class="h-full rounded-full bg-amber-500" style="width: 96%"></div>
+                <div class="h-full rounded-full bg-amber-500" style="width: ${confPercent}%"></div>
               </div>
-              <span class="font-mono text-[10px] font-semibold text-slate-600">${t("aiConfidence", { percent: "96" })}</span>
+              <span class="font-mono text-[10px] font-semibold text-slate-600">${confPercent}% conf</span>
             </div>
-            <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: "3" })}</span>
+            <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: line.line_number || "3" })}</span>
           </div>
 
           <!-- Review Trigger Button (Touch target >= 48px) -->
@@ -1070,8 +1176,9 @@
       `;
     }
 
-    // 2. FIX-M8 Card
-    if (isFix) {
+    // 2. FIX-M8 Unordered SKU Card (Only if actually unknown)
+    if (isFixUnknown) {
+      const recQty = line.received_qty || 12;
       return `
         <article class="rounded-xl border ${state.fixApproved ? "border-emerald-300 bg-emerald-50/20" : "border-red-300 bg-red-50/25"
         } p-3.5 shadow-sm transition space-y-2.5" data-sku="FIX-M8" tabindex="0">
@@ -1080,11 +1187,11 @@
               <h4 class="font-bold text-sm text-slate-900 leading-snug">${line.item_name}</h4>
               <div class="flex items-center gap-2 mt-0.5">
                 <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">FIX-M8</span>
-                <span class="text-[11px] text-slate-500">boxes</span>
+                <span class="text-[11px] text-slate-500">${line.unit || 'boxes'}</span>
               </div>
             </div>
             <div class="shrink-0">
-              ${renderStatusBadge("UNKNOWN_SKU")}
+              <span class="bg-red-100 text-red-800 px-2.5 py-1 rounded-md text-xs font-bold border border-red-200 whitespace-nowrap">UNORDERED SKU</span>
             </div>
           </div>
 
@@ -1093,12 +1200,12 @@
             <div>
               <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider block">${t("deliveredOrdered")}</span>
               <div class="flex items-baseline gap-1 mt-0.5">
-                <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="12">12</span>
-                <span class="text-xs font-semibold text-slate-500">/ 0 boxes</span>
+                <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="${recQty}">${recQty}</span>
+                <span class="text-xs font-semibold text-slate-500">/ 0 ${line.unit || 'boxes'}</span>
               </div>
             </div>
-            <span class="px-2 py-1 rounded-md text-xs font-black bg-red-200/90 text-red-900 border border-red-300 whitespace-nowrap">
-              ${t("unorderedChip", { count: "12" })}
+            <span class="px-2 py-1 rounded-md text-xs font-black bg-red-100 text-red-900 border border-red-300 whitespace-nowrap">
+              +${recQty} unordered
             </span>
           </div>
 
@@ -1130,9 +1237,89 @@
       `;
     }
 
-    // 3. CEM-25, TIM-4595 Cards
+    // 3. General Dynamic Item Card (Strict Mutually Exclusive Badges)
+    const isOk = line.match_status === "OK" && (line.ordered_qty === undefined || line.received_qty === line.ordered_qty);
+    const isShort = line.match_status === "SHORT" || (line.ordered_qty !== undefined && line.received_qty < line.ordered_qty);
+    const isOver = line.match_status === "OVER" || (line.ordered_qty !== undefined && line.received_qty > line.ordered_qty);
+    const isUnknown = line.match_status === "UNKNOWN_SKU";
+
+    let badgeHtml = "";
+    let varianceChipHtml = "";
+    let reviewActionHtml = "";
+
+    const isReviewed = Boolean(state.reviewedExceptions && state.reviewedExceptions[line.sku_code]);
+
+    if (isOk) {
+      badgeHtml = `<span class="bg-green-100 text-green-800 px-2.5 py-1 rounded-md text-xs font-bold border border-green-200 whitespace-nowrap">100% matched</span>`;
+      varianceChipHtml = `<span class="px-2 py-0.5 rounded text-[11px] font-bold text-green-800 bg-green-50 border border-green-200 whitespace-nowrap">Match</span>`;
+    } else if (isShort) {
+      badgeHtml = `<span class="bg-yellow-100 text-yellow-800 px-2.5 py-1 rounded-md text-xs font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>`;
+      const deficit = (line.received_qty || 0) - (line.ordered_qty || 0);
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-yellow-100 text-yellow-900 border border-yellow-300 whitespace-nowrap">${deficit} ${line.unit || ''} short</span>`;
+      reviewActionHtml = `
+        <button type="button" data-action="review-general" data-sku="${line.sku_code}"
+          class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
+            ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
+            : "bg-amber-100 hover:bg-amber-200 text-amber-950 border-amber-300"
+          }">
+          ${isReviewed
+            ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+               <span>Shortage acknowledged (${line.sku_code})</span>`
+            : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
+               <span>Review shortage (${line.sku_code})</span>`
+          }
+        </button>
+      `;
+    } else if (isOver) {
+      const surplus = (line.received_qty || 0) - (line.ordered_qty || 0);
+      badgeHtml = `<span class="bg-blue-100 text-blue-800 px-2.5 py-1 rounded-md text-xs font-bold border border-blue-200 whitespace-nowrap">OVER (+${surplus})</span>`;
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-blue-100 text-blue-900 border border-blue-300 whitespace-nowrap">+${surplus} ${line.unit || ''} surplus</span>`;
+      reviewActionHtml = `
+        <button type="button" data-action="review-general" data-sku="${line.sku_code}"
+          class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
+            ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
+            : "bg-blue-100 hover:bg-blue-200 text-blue-950 border-blue-300"
+          }">
+          ${isReviewed
+            ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+               <span>Over-delivery accepted (${line.sku_code})</span>`
+            : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
+               <span>Approve over-delivery (+${surplus})</span>`
+          }
+        </button>
+      `;
+    } else if (isUnknown) {
+      badgeHtml = `<span class="bg-red-100 text-red-800 px-2.5 py-1 rounded-md text-xs font-bold border border-red-200 whitespace-nowrap">UNORDERED SKU</span>`;
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-red-100 text-red-900 border border-red-300 whitespace-nowrap">+${line.received_qty} unordered</span>`;
+      reviewActionHtml = `
+        <button type="button" data-action="review-general" data-sku="${line.sku_code}"
+          class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
+            ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
+            : "bg-red-100 hover:bg-red-200 text-red-950 border-red-300"
+          }">
+          ${isReviewed
+            ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+               <span>Override approved (${line.sku_code})</span>`
+            : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
+               <span>Approve unordered receipt (${line.sku_code})</span>`
+          }
+        </button>
+      `;
+    } else {
+      badgeHtml = `<span class="bg-slate-100 text-slate-800 px-2.5 py-1 rounded-md text-xs font-bold border border-slate-200 whitespace-nowrap">${line.match_status || "PENDING"}</span>`;
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-bold text-slate-600 bg-slate-100 border border-slate-200 whitespace-nowrap">${line.match_status || "PENDING"}</span>`;
+    }
+
+    const cardBorderClass = isOk
+      ? "border-slate-200 bg-white"
+      : isShort
+      ? (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-amber-300 bg-amber-50/20")
+      : isOver
+      ? (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-blue-300 bg-blue-50/20")
+      : (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-red-300 bg-red-50/20");
+
     return `
-      <article class="rounded-xl border border-slate-200 bg-white p-3.5 shadow-sm transition space-y-2.5" data-sku="${line.sku_code}">
+      <article class="rounded-xl border ${cardBorderClass} p-3.5 shadow-sm transition space-y-2.5" data-sku="${line.sku_code}">
         <div class="flex items-start justify-between gap-2">
           <div class="min-w-0 flex-1">
             <h4 class="font-bold text-sm text-slate-900 leading-snug line-clamp-2">${line.item_name}</h4>
@@ -1142,7 +1329,7 @@
             </div>
           </div>
           <div class="shrink-0">
-            ${renderStatusBadge(line.match_status)}
+            ${badgeHtml}
           </div>
         </div>
 
@@ -1151,50 +1338,76 @@
             <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider block">${t("deliveredOrdered")}</span>
             <div class="flex items-baseline gap-1 mt-0.5">
               <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="${line.received_qty}">${line.received_qty}</span>
-              <span class="text-xs font-semibold text-slate-500">/ ${line.ordered_qty} ${line.unit}</span>
+              <span class="text-xs font-semibold text-slate-500">/ ${line.ordered_qty || 0} ${line.unit}</span>
             </div>
           </div>
-          <span class="px-2 py-1 rounded-md text-xs font-bold text-emerald-800 bg-emerald-100 border border-emerald-200 whitespace-nowrap">
-            ${t("matchedOk")}
-          </span>
+          ${varianceChipHtml}
         </div>
 
         <div class="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
           <div class="flex items-center gap-1.5 flex-1 mr-3">
             <div class="w-16 h-1.5 rounded-full bg-slate-200 overflow-hidden shrink-0">
-              <div class="h-full rounded-full bg-emerald-500" style="width: ${confPercent}%"></div>
+              <div class="h-full rounded-full ${isOk ? "bg-emerald-500" : isShort ? "bg-amber-500" : "bg-red-500"}" style="width: ${confPercent}%"></div>
             </div>
-            <span class="font-mono text-[10px] font-semibold text-slate-600">${t("aiConfidence", { percent: confPercent })}</span>
+            <span class="font-mono text-[10px] font-semibold text-slate-600">${confPercent}% conf</span>
           </div>
           <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: line.line_number || "N/A" })}</span>
         </div>
+
+        ${reviewActionHtml}
       </article>
     `;
   }
 
-  function renderStep2Match() {
-    if (!state.scanResult) return "";
+  /**
+   * Render reconciliation items dynamically from payload.
+   * Calculates totals dynamically with strict conditional badges.
+   */
+  function renderReconciliation(scanResultOrPayload) {
+    const payload = Array.isArray(scanResultOrPayload)
+      ? scanResultOrPayload
+      : (scanResultOrPayload ? (scanResultOrPayload.lines || scanResultOrPayload.items || []) : []);
 
-    const rawLines = state.scanResult.lines || state.scanResult.items || [];
-    const spotlightLines = [];
-    const otherLines = [];
+    if (!payload || payload.length === 0) {
+      return `
+        <div class="flex-1 p-6 text-center text-slate-500">
+          <p class="text-sm">No items extracted from scan.</p>
+        </div>
+      `;
+    }
 
-    SPOTLIGHT_SKU_ORDER.forEach((sku) => {
-      const found = rawLines.find((l) => l.sku_code === sku);
-      if (found) spotlightLines.push(found);
-    });
+    // Dynamic Summary Math directly from payload
+    const totalLines = payload.length;
+    const okCount = payload.filter((item) => item.match_status === "OK" && (item.ordered_qty === undefined || item.received_qty === item.ordered_qty)).length;
+    const discrepancyCount = totalLines - okCount;
+    const lowConfCount = payload.filter((item) => (item.confidence_score || 0) < 0.85).length;
+    const discLabel = discrepancyCount === 1 ? "Discrepancy" : "Discrepancies";
 
-    rawLines.forEach((l) => {
-      if (!SPOTLIGHT_SKU_ORDER.includes(l.sku_code)) {
-        otherLines.push(l);
-      }
-    });
+    // Partition lines: if 5 or fewer items, show all directly; otherwise spotlight + accordion
+    let spotlightLines = [];
+    let otherLines = [];
 
-    const summary = state.scanResult.summary || {};
-    const totalLines = summary.total_lines || rawLines.length;
-    const okLines = summary.ok_lines || 12;
-    const mismatchLines = summary.mismatch_lines || 2;
-    const lowConfLines = summary.low_confidence_lines || 1;
+    if (totalLines <= 5) {
+      spotlightLines = [...payload];
+      otherLines = [];
+    } else {
+      SPOTLIGHT_SKU_ORDER.forEach((sku) => {
+        const found = payload.find((l) => l.sku_code === sku);
+        if (found) spotlightLines.push(found);
+      });
+      // Add any other discrepancies to spotlight
+      payload.forEach((l) => {
+        if (l.match_status !== "OK" && !spotlightLines.some((s) => s.sku_code === l.sku_code)) {
+          spotlightLines.push(l);
+        }
+      });
+      // Remaining OK lines go to accordion
+      payload.forEach((l) => {
+        if (!spotlightLines.some((s) => s.sku_code === l.sku_code)) {
+          otherLines.push(l);
+        }
+      });
+    }
 
     return `
       <div class="flex-1 p-3.5 space-y-3.5 pb-24">
@@ -1208,38 +1421,47 @@
               </h2>
             </div>
             <span class="text-xs font-mono font-bold bg-slate-100 text-slate-700 px-2 py-0.5 rounded border border-slate-200 whitespace-nowrap">
-              ${t("linesCount", { count: totalLines })}
+              ${totalLines} ${totalLines === 1 ? 'line' : 'lines'}
             </span>
+          </div>
+
+          <!-- Dynamic Summary Math -->
+          <div class="text-xs font-bold text-slate-800 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200 font-mono">
+            Total: ${totalLines} lines | ${okCount} OK | ${discrepancyCount} ${discLabel}
           </div>
 
           <!-- Highlight Chips -->
           <div class="flex flex-wrap gap-1.5 pt-1">
-            <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-              <span>✓</span> ${t("linesOkChip", { ok: okLines, total: totalLines })}
+            <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-green-100 text-green-800 border border-green-300">
+              <span>✓</span> ${okCount} of ${totalLines} lines OK
             </span>
-            <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">
-              <span>!</span> ${t("discrepanciesChip", { count: mismatchLines })}
+            <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold ${
+              discrepancyCount > 0 ? "bg-yellow-100 text-yellow-900 border border-yellow-300" : "bg-slate-100 text-slate-600 border border-slate-200"
+            }">
+              <span>!</span> ${discrepancyCount} ${discLabel}
             </span>
-            <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-red-100 text-red-900 border border-red-300">
-              <span>✕</span> ${t("lowConfidenceChip", { count: lowConfLines })}
-            </span>
+            ${lowConfCount > 0 ? `
+              <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-red-100 text-red-900 border border-red-300">
+                <span>✕</span> ${lowConfCount} Low Confidence
+              </span>
+            ` : ""}
           </div>
         </section>
 
         <!-- Spotlight Items Section Header -->
         <div class="flex items-center justify-between px-1">
           <h3 class="text-xs font-bold uppercase tracking-wider text-slate-600">${t("spotlightHeader")}</h3>
-          <span class="text-[11px] text-slate-500 font-medium">${t("spotlightSub")}</span>
+          <span class="text-[11px] text-slate-500 font-medium">${spotlightLines.length} item(s)</span>
         </div>
 
         <!-- Spotlight Cards -->
-        <div class="space-y-3">
+        <div class="space-y-3" id="spotlight-cards-container">
           ${spotlightLines.map((line) => renderSpotlightCard(line)).join("")}
         </div>
 
-        <!-- Collapsible Accordion for 10 other lines -->
+        <!-- Collapsible Accordion for other lines -->
         ${otherLines.length > 0
-        ? `
+          ? `
           <div class="rounded-xl border border-slate-200 bg-white overflow-hidden shadow-sm mt-3">
             <button id="btn-toggle-accordion" type="button"
               class="w-full min-h-[48px] px-4 py-3 bg-slate-50 hover:bg-slate-100 flex items-center justify-between text-left transition font-semibold text-xs text-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500">
@@ -1253,34 +1475,45 @@
             </button>
 
             ${state.accordionOpen
-          ? `
+              ? `
               <div class="divide-y divide-slate-100 px-3.5 py-1 bg-white">
                 ${otherLines
-            .map(
-              (item) => `
+                  .map(
+                    (item) => `
                   <div class="py-2.5 flex items-center justify-between text-xs">
                     <div class="min-w-0 pr-2">
                       <div class="font-bold text-slate-900 truncate">${item.item_name}</div>
-                      <div class="font-mono text-[11px] text-slate-500">${item.sku_code} &bull; ${item.received_qty} / ${item.ordered_qty} ${item.unit}</div>
+                      <div class="font-mono text-[11px] text-slate-500">${item.sku_code} &bull; ${item.received_qty} / ${item.ordered_qty || 0} ${item.unit || ''}</div>
                     </div>
                     <div class="shrink-0 flex items-center gap-1.5">
-                      <span class="text-[10px] font-mono text-slate-400">98%</span>
-                      <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">OK</span>
+                      <span class="text-[10px] font-mono text-slate-400">${Math.round((item.confidence_score || 0.98) * 100)}%</span>
+                      ${item.match_status === "OK" && (item.ordered_qty === undefined || item.received_qty === item.ordered_qty)
+                        ? `<span class="bg-green-100 text-green-800 px-1.5 py-0.5 rounded text-[10px] font-bold border border-green-200 whitespace-nowrap">100% matched</span>`
+                        : item.match_status === "SHORT" || (item.ordered_qty !== undefined && item.received_qty < item.ordered_qty)
+                        ? `<span class="bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded text-[10px] font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>`
+                        : item.match_status === "OVER" || (item.ordered_qty !== undefined && item.received_qty > item.ordered_qty)
+                        ? `<span class="bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded text-[10px] font-bold border border-blue-200 whitespace-nowrap">OVER</span>`
+                        : `<span class="bg-red-100 text-red-800 px-1.5 py-0.5 rounded text-[10px] font-bold border border-red-200 whitespace-nowrap">UNORDERED</span>`
+                      }
                     </div>
                   </div>
                 `
-            )
-            .join("")}
+                  )
+                  .join("")}
               </div>
             `
-          : ""
-        }
+              : ""
+            }
           </div>
         `
-        : ""
-      }
+          : ""
+        }
       </div>
     `;
+  }
+
+  function renderStep2Match() {
+    return renderReconciliation(state.scanResult);
   }
 
   // -------------------------------------------------------------------------
@@ -1333,22 +1566,47 @@
             </div>
 
             <div class="space-y-1.5 text-xs">
-              <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: 50ms;">
-                <span class="text-slate-800 font-medium">CEM-25 (Rapid Cement)</span>
-                <span class="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">+80 ATP</span>
-              </div>
-              <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: 100ms;">
-                <span class="text-slate-800 font-medium">TIM-4595 (Structural Timber)</span>
-                <span class="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">+40 ATP</span>
-              </div>
-              <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: 150ms;">
-                <span class="text-slate-800 font-medium">PLAST-01 (Plasterboard)</span>
-                <span class="font-mono font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">+52 ATP (-8 short)</span>
-              </div>
-              <div class="flex items-center justify-between py-1 animate-float-up" style="animation-delay: 200ms;">
-                <span class="text-slate-800 font-medium">FIX-M8 (Heavy Anchors)</span>
-                <span class="font-mono font-bold text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200">${t("quarantineHeldLabel")}</span>
-              </div>
+              ${(state.lastConfirmedPayload?.confirmed_lines && state.lastConfirmedPayload.confirmed_lines.length > 0)
+                ? state.lastConfirmedPayload.confirmed_lines.map((line, idx) => {
+                    const isQuarantine = line.reason_code === "unordered_quarantine" || (line.match_status === "UNKNOWN_SKU" && !state.fixApproved);
+                    const isShort = line.match_status === "SHORT";
+                    const delayMs = (idx + 1) * 50;
+
+                    let chipHtml = "";
+                    if (isQuarantine) {
+                      chipHtml = `<span class="font-mono font-bold text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200">${t("quarantineHeldLabel")}</span>`;
+                    } else if (isShort) {
+                      chipHtml = `<span class="font-mono font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">+${line.received_qty} ATP (short)</span>`;
+                    } else {
+                      chipHtml = `<span class="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">+${line.received_qty} ATP</span>`;
+                    }
+
+                    return `
+                      <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: ${delayMs}ms;">
+                        <span class="text-slate-800 font-medium">${line.sku_code}</span>
+                        ${chipHtml}
+                      </div>
+                    `;
+                  }).join("")
+                : `
+                  <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: 50ms;">
+                    <span class="text-slate-800 font-medium">CEM-25 (Rapid Cement)</span>
+                    <span class="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">+80 ATP</span>
+                  </div>
+                  <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: 100ms;">
+                    <span class="text-slate-800 font-medium">TIM-4595 (Structural Timber)</span>
+                    <span class="font-mono font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">+40 ATP</span>
+                  </div>
+                  <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: 150ms;">
+                    <span class="text-slate-800 font-medium">PLAST-01 (Plasterboard)</span>
+                    <span class="font-mono font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">+52 ATP (-8 short)</span>
+                  </div>
+                  <div class="flex items-center justify-between py-1 animate-float-up" style="animation-delay: 200ms;">
+                    <span class="text-slate-800 font-medium">FIX-M8 (Heavy Anchors)</span>
+                    <span class="font-mono font-bold text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200">${t("quarantineHeldLabel")}</span>
+                  </div>
+                `
+              }
             </div>
           </section>
 
@@ -1388,7 +1646,16 @@
 
     const recQty = state.plastDraft.received_qty;
     const ordQty = 60;
-    const shortfall = recQty - ordQty;
+    const variance = recQty - ordQty;
+
+    let badgeHtml = "";
+    if (variance < 0) {
+      badgeHtml = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-amber-200 text-amber-950 border border-amber-300 whitespace-nowrap">${variance} sheets deficit</span>`;
+    } else if (variance === 0) {
+      badgeHtml = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-emerald-200 text-emerald-950 border border-emerald-300 whitespace-nowrap">Match (60/60 sheets)</span>`;
+    } else {
+      badgeHtml = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-blue-200 text-blue-950 border border-blue-300 whitespace-nowrap">+${variance} sheets surplus</span>`;
+    }
 
     return `
       <div id="sheet-backdrop" class="fixed inset-0 bg-slate-950/70 backdrop-blur-xs z-40 transition-opacity"></div>
@@ -1408,7 +1675,7 @@
           </button>
         </div>
 
-        <!-- Large +/- Stepper -->
+        <!-- Large +/- Stepper with Reactive Variance -->
         <div class="bg-slate-50 rounded-2xl p-4 border border-slate-200 space-y-2 text-center">
           <span class="text-xs uppercase font-bold text-slate-500 tracking-wider">${t("physicalCountLabel")}</span>
           
@@ -1418,8 +1685,9 @@
               −
             </button>
 
-            <div id="plast-stepper-val" tabindex="0" class="min-w-[90px] text-center focus:outline-none">
-              <span class="text-4xl font-black font-mono text-slate-900 tracking-tight">${recQty}</span>
+            <div id="plast-stepper-val" class="min-w-[90px] text-center focus:outline-none">
+              <input id="plast-qty-input" type="number" min="0" value="${recQty}"
+                class="w-24 text-center text-4xl font-black font-mono text-slate-900 bg-transparent border-b-2 border-slate-300 focus:border-orange-500 focus:outline-none" />
               <span class="block text-xs font-semibold text-slate-500">${t("sheetsUnit")}</span>
             </div>
 
@@ -1429,10 +1697,8 @@
             </button>
           </div>
 
-          <div class="pt-1">
-            <span class="px-2.5 py-1 rounded-md text-xs font-black bg-amber-200 text-amber-950 border border-amber-300 whitespace-nowrap">
-              ${t("deficitLabel", { count: shortfall })}
-            </span>
+          <div id="plast-variance-badge" class="pt-1">
+            ${badgeHtml}
           </div>
         </div>
 
@@ -1539,49 +1805,67 @@
       return "";
     }
 
-    const plastReviewed = state.plastReview.reviewed;
-    const fixApproved = state.fixApproved;
-    const canConfirm = plastReviewed && fixApproved;
+    const payload = state.scanResult
+      ? (state.scanResult.lines || state.scanResult.items || [])
+      : [];
+
+    const discrepancies = payload.filter(
+      (l) => l.match_status !== "OK" || (l.ordered_qty !== undefined && l.received_qty !== l.ordered_qty)
+    );
+
+    const unresolvedDiscrepancies = discrepancies.filter((l) => {
+      if (l.sku_code === "PLAST-01") return !state.plastReview.reviewed;
+      if (l.sku_code === "FIX-M8") return !state.fixApproved;
+      return !Boolean(state.reviewedExceptions && state.reviewedExceptions[l.sku_code]);
+    });
+
+    const totalDiscrepancies = discrepancies.length;
+    const reviewedCount = totalDiscrepancies - unresolvedDiscrepancies.length;
+    const canConfirm = unresolvedDiscrepancies.length === 0;
+
+    let guidanceHtml = "";
+    if (unresolvedDiscrepancies.length > 0) {
+      const skuList = unresolvedDiscrepancies.map((l) => l.sku_code).join(", ");
+      guidanceHtml = `
+        <div class="flex items-center justify-between text-[11px] font-semibold text-amber-900 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
+          <span class="flex items-center gap-1 truncate mr-2">
+            <span>⚠</span> Review discrepancy: ${skuList}
+          </span>
+          <span class="font-mono text-[10px] text-amber-700 font-bold shrink-0">${reviewedCount}/${totalDiscrepancies}</span>
+        </div>
+      `;
+    } else {
+      guidanceHtml = `
+        <div class="flex items-center gap-1 text-[11px] font-semibold text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200">
+          <span>✓</span> Ready to confirm (${state.isOnline ? "Online" : "Offline"})
+        </div>
+      `;
+    }
+
+    const totalLines = payload.length;
+    const lineLabel = totalLines === 1 ? "line" : "lines";
 
     return `
       <div class="fixed bottom-0 left-0 right-0 max-w-[430px] mx-auto bg-white/95 backdrop-blur-md border-t border-slate-200 px-4 py-3 safe-bottom z-30 shadow-[0_-4px_20px_rgba(0,0,0,0.06)]">
         <div class="space-y-1.5">
-          <!-- Status guidance pill -->
-          ${!canConfirm
-        ? `
-            <div class="flex items-center justify-between text-[11px] font-semibold text-amber-900 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
-              <span class="flex items-center gap-1">
-                <span>⚠</span> ${!plastReviewed && !fixApproved
-          ? t("guideReviewBoth")
-          : !plastReviewed
-            ? t("guideReviewPlast")
-            : t("guideApproveFix")
-        }
-              </span>
-              <span class="font-mono text-[10px] text-amber-700 font-bold">${(plastReviewed ? 1 : 0) + (fixApproved ? 1 : 0)
-        }/2</span>
-            </div>
-          `
-        : `
-            <div class="flex items-center gap-1 text-[11px] font-semibold text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-md border border-emerald-200">
-              <span>✓</span> ${t("guideReady", { mode: state.isOnline ? t("online") : t("offline") })}
-            </div>
-          `
-      }
+          <!-- Status guidance pill (dynamically derived from discrepancy status) -->
+          ${guidanceHtml}
 
-          <!-- Confirm receipt button -->
+          <!-- Confirm receipt button with dynamic line count label -->
           <button id="btn-confirm-receipt" type="button"
             ${!canConfirm || state.confirming ? "disabled" : ""}
-            class="w-full min-h-[52px] rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition cursor-pointer shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${canConfirm && !state.confirming
-        ? "bg-orange-600 hover:bg-orange-500 active:scale-98 text-white shadow-orange-600/30"
-        : "bg-slate-200 text-slate-400 border border-slate-300 cursor-not-allowed shadow-none"
-      }">
-            ${state.confirming
-        ? `<svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
+            class="w-full min-h-[52px] rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition cursor-pointer shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${
+              canConfirm && !state.confirming
+                ? "bg-orange-600 hover:bg-orange-500 active:scale-98 text-white shadow-orange-600/30"
+                : "bg-slate-200 text-slate-400 border border-slate-300 cursor-not-allowed shadow-none"
+            }">
+            ${
+              state.confirming
+                ? `<svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>
                    <span>${t("confirmingBtn")}</span>`
-        : `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"/></svg>
-                   <span>${t("confirmReceiptBtn")}</span>`
-      }
+                : `<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"/></svg>
+                   <span>Confirm receipt (${totalLines} ${lineLabel})</span>`
+            }
           </button>
         </div>
       </div>
@@ -1685,8 +1969,8 @@
   function render() {
     if (!dom.appContainer) cacheDom();
 
-    // Apply Phone Frame and Dock Mode styling dynamically
-    let containerClass = "w-full max-w-full sm:max-w-[430px] min-h-screen sm:min-h-[844px] sm:max-h-[890px] bg-slate-50 text-slate-900 flex flex-col relative overflow-hidden shrink-0 transition-all";
+    // Apply Phone Frame, Dock Mode and 100dvh mobile resilient layout
+    let containerClass = "mobile-scanner-view w-full max-w-full sm:max-w-[430px] min-h-[100dvh] h-[100dvh] sm:h-auto sm:min-h-[844px] sm:max-h-[890px] bg-slate-50 text-slate-900 flex flex-col relative overflow-hidden shrink-0 transition-all";
     if (state.phoneFrame) {
       containerClass += " sm:rounded-[36px] sm:shadow-2xl sm:border sm:border-slate-800";
     } else {
@@ -1697,9 +1981,23 @@
     }
     dom.appContainer.className = containerClass;
 
+    // Mobile background scroll lock when bottom sheet is active
+    if (dom.mainContent) {
+      if (state.activeSheet) {
+        dom.mainContent.classList.add("modal-open-scroll-lock");
+      } else {
+        dom.mainContent.classList.remove("modal-open-scroll-lock");
+      }
+    }
+
     dom.topBar.innerHTML = renderTopBar();
     dom.mobileCaptionBar.innerHTML = renderMobileCaptionBar();
     dom.progressBar.innerHTML = renderProgressBar();
+
+    // Explicitly clear main container before rendering to prevent hardcode/demo HTML bleed (Requirement 1)
+    if (dom.mainContent) {
+      dom.mainContent.innerHTML = "";
+    }
 
     if (state.step === 1) {
       dom.mainContent.innerHTML = renderStep1Scan();
@@ -1722,13 +2020,35 @@
   // -------------------------------------------------------------------------
 
   function attachEvents() {
-    // Step 1: Scan trigger
+    // Step 1: Scan trigger (demo)
     const scanBtn = document.getElementById("btn-trigger-scan");
     if (scanBtn) {
       scanBtn.onclick = (e) => {
         e.preventDefault();
         triggerScan();
       };
+    }
+
+    // Step 1: Upload real photo trigger — opens the hidden file input
+    const uploadBtn = document.getElementById("btn-upload-scan");
+    const ocrFileInput = document.getElementById("ocrFileInput");
+    if (uploadBtn && ocrFileInput) {
+      uploadBtn.onclick = (e) => {
+        e.preventDefault();
+        ocrFileInput.value = "";  // Reset so same file can be re-selected
+        ocrFileInput.click();
+      };
+    }
+
+    // Handle file selection from hidden input (real AI OCR path)
+    if (ocrFileInput && !ocrFileInput.__nexbuild_wired) {
+      ocrFileInput.__nexbuild_wired = true;
+      ocrFileInput.addEventListener("change", (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) {
+          triggerRealScan(file);
+        }
+      });
     }
 
     // Step 2: Open PLAST-01 Sheet
@@ -1749,15 +2069,44 @@
       };
     }
 
-    // Step 2: PLAST-01 Stepper
+    // Step 2: PLAST-01 Stepper with Proper Numerical State Mutation & Real-Time Variance
+    function updatePlastStepperDelta(delta) {
+      const inputField = document.getElementById("plast-qty-input");
+      let currentVal = inputField ? parseInt(inputField.value, 10) : (state.plastDraft ? parseInt(state.plastDraft.received_qty, 10) : 52);
+      if (isNaN(currentVal)) currentVal = 0;
+      
+      currentVal = Math.max(0, currentVal + delta);
+      
+      if (inputField) {
+        inputField.value = currentVal;
+      }
+      if (state.plastDraft) {
+        state.plastDraft.received_qty = currentVal;
+      }
+      
+      // Real-time Reactivity: Immediately recalculate variance and update badge color & text
+      const expectedQty = 60;
+      const variance = currentVal - expectedQty;
+      const varianceBadge = document.getElementById("plast-variance-badge");
+      if (varianceBadge) {
+        if (variance < 0) {
+          varianceBadge.innerHTML = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-amber-200 text-amber-950 border border-amber-300 whitespace-nowrap">${variance} sheets deficit</span>`;
+        } else if (variance === 0) {
+          varianceBadge.innerHTML = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-emerald-200 text-emerald-950 border border-emerald-300 whitespace-nowrap">Match (60/60 sheets)</span>`;
+        } else {
+          varianceBadge.innerHTML = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-blue-200 text-blue-950 border border-blue-300 whitespace-nowrap">+${variance} sheets surplus</span>`;
+        }
+      }
+      if (window.Fx && typeof window.Fx.playBeep === "function") {
+        window.Fx.playBeep();
+      }
+    }
+
     const stepperMinus = document.getElementById("btn-stepper-minus");
     if (stepperMinus) {
       stepperMinus.onclick = (e) => {
         e.preventDefault();
-        if (state.plastDraft && state.plastDraft.received_qty > 0) {
-          state.plastDraft.received_qty -= 1;
-          render();
-        }
+        updatePlastStepperDelta(-1);
       };
     }
 
@@ -1765,9 +2114,28 @@
     if (stepperPlus) {
       stepperPlus.onclick = (e) => {
         e.preventDefault();
+        updatePlastStepperDelta(1);
+      };
+    }
+
+    const plastQtyInput = document.getElementById("plast-qty-input");
+    if (plastQtyInput) {
+      plastQtyInput.oninput = (e) => {
+        let currentVal = parseInt(e.target.value, 10);
+        if (isNaN(currentVal) || currentVal < 0) currentVal = 0;
         if (state.plastDraft) {
-          state.plastDraft.received_qty += 1;
-          render();
+          state.plastDraft.received_qty = currentVal;
+        }
+        const variance = currentVal - 60;
+        const varianceBadge = document.getElementById("plast-variance-badge");
+        if (varianceBadge) {
+          if (variance < 0) {
+            varianceBadge.innerHTML = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-amber-200 text-amber-950 border border-amber-300 whitespace-nowrap">${variance} sheets deficit</span>`;
+          } else if (variance === 0) {
+            varianceBadge.innerHTML = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-emerald-200 text-emerald-950 border border-emerald-300 whitespace-nowrap">Match (60/60 sheets)</span>`;
+          } else {
+            varianceBadge.innerHTML = `<span class="px-2.5 py-1 rounded-md text-xs font-black bg-blue-200 text-blue-950 border border-blue-300 whitespace-nowrap">+${variance} sheets surplus</span>`;
+          }
         }
       };
     }
@@ -1845,6 +2213,21 @@
       };
     }
 
+    // Step 2: Generic discrepancy review / acknowledgement toggle
+    document.querySelectorAll('[data-action="review-general"]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const sku = btn.getAttribute("data-sku");
+        if (sku) {
+          state.reviewedExceptions = state.reviewedExceptions || {};
+          state.reviewedExceptions[sku] = !state.reviewedExceptions[sku];
+          render();
+          showToast(`Discrepancy for ${sku} ${state.reviewedExceptions[sku] ? "acknowledged" : "unacknowledged"}`);
+        }
+      };
+    });
+
     // Step 2: Confirm receipt
     const confirmBtn = document.getElementById("btn-confirm-receipt");
     if (confirmBtn) {
@@ -1890,6 +2273,7 @@
         state.plastReview.reviewed = false;
         state.plastReview.received_qty = 52;
         state.fixApproved = false;
+        state.reviewedExceptions = {};
         state.lastTransactionResult = null;
         state.isOfflineSaved = false;
         state.activeCaption = "AI reads the delivery note and matches it to PO-48213";

@@ -16,7 +16,8 @@
   // Application State
   const state = {
     items: [],
-    previousCounts: {}, // sku_code -> atp_qty (to detect deltas)
+    updatedSkus: new Set(), // Set of sku_code updated in current session
+    updatedDeltas: {},      // sku_code -> delta (+amount)
     searchQuery: "",
     selectedCategory: "",
     lastSyncTime: new Date(),
@@ -31,6 +32,8 @@
     dom = {
       tbody: document.getElementById("inventory-tbody"),
       searchInput: document.getElementById("search-input"),
+      btnClearSearch: document.getElementById("btn-clear-search"),
+      skuCountBadge: document.getElementById("sku-count-badge"),
       categoryFilter: document.getElementById("category-filter"),
       btnRefresh: document.getElementById("btn-refresh"),
       btnModeToggle: document.getElementById("btn-mode-toggle"),
@@ -53,12 +56,31 @@
     try {
       const resp = await window.Api.getATP();
       if (resp && resp.items) {
-        // Record previous counts before updating
-        const oldCounts = {};
-        state.items.forEach((item) => {
-          oldCounts[item.sku_code] = item.atp_qty;
-        });
-        state.previousCounts = oldCounts;
+        // Detect SKUs that received stock increases for real-time row flash
+        const newUpdated = new Set();
+        const newDeltas = {};
+
+        if (state.items.length > 0) {
+          resp.items.forEach((newItem) => {
+            const old = state.items.find((i) => i.sku_code === newItem.sku_code);
+            if (old && newItem.atp_qty > old.atp_qty) {
+              const delta = Math.round((newItem.atp_qty - old.atp_qty) * 10) / 10;
+              newUpdated.add(newItem.sku_code);
+              newDeltas[newItem.sku_code] = delta;
+            }
+          });
+        }
+
+        if (newUpdated.size > 0) {
+          state.updatedSkus = newUpdated;
+          state.updatedDeltas = newDeltas;
+          // Clear flash animation after 3.2s
+          setTimeout(() => {
+            state.updatedSkus = new Set();
+            state.updatedDeltas = {};
+            renderTable();
+          }, 3200);
+        }
 
         state.items = resp.items;
         state.lastSyncTime = new Date();
@@ -145,6 +167,27 @@
   function renderTable() {
     if (!dom.tbody) return;
 
+    // Zero CLS: Show structured skeleton rows while initial fetch is loading
+    if (state.loading && state.items.length === 0) {
+      dom.tbody.innerHTML = Array.from({ length: 6 })
+        .map(
+          () => `
+          <tr class="skeleton-shimmer border-b border-slate-800">
+            <td class="py-3 px-4"><div class="h-6 w-20 bg-slate-700/60 rounded"></div></td>
+            <td class="py-3 px-4"><div class="h-4 w-48 bg-slate-700/60 rounded mb-1"></div><div class="h-3 w-24 bg-slate-800 rounded"></div></td>
+            <td class="py-3 px-3"><div class="h-4 w-28 bg-slate-700/50 rounded"></div></td>
+            <td class="py-3 px-3 text-right"><div class="h-4 w-14 bg-slate-700/50 rounded ml-auto"></div></td>
+            <td class="py-3 px-4 text-right"><div class="h-6 w-16 bg-emerald-950/60 rounded ml-auto"></div></td>
+            <td class="py-3 px-3 text-right"><div class="h-4 w-10 bg-slate-800 rounded ml-auto"></div></td>
+            <td class="py-3 px-3 text-center"><div class="h-5 w-20 bg-slate-800 rounded mx-auto"></div></td>
+            <td class="py-3 px-4 text-right"><div class="h-4 w-16 bg-slate-800 rounded ml-auto"></div></td>
+          </tr>
+        `
+        )
+        .join("");
+      return;
+    }
+
     // Filter items
     let filtered = state.items;
 
@@ -163,6 +206,16 @@
       filtered = filtered.filter((i) => i.category === state.selectedCategory);
     }
 
+    // Update SKU Count Badge & Clear Search Button
+    if (dom.skuCountBadge) {
+      const filterSuffix = state.selectedCategory ? ` (${state.selectedCategory})` : "";
+      dom.skuCountBadge.textContent = `Showing ${filtered.length} of ${state.items.length} SKUs${filterSuffix}`;
+    }
+
+    if (dom.btnClearSearch) {
+      dom.btnClearSearch.style.display = state.searchQuery ? "flex" : "none";
+    }
+
     if (filtered.length === 0) {
       dom.tbody.innerHTML = `
         <tr>
@@ -178,17 +231,16 @@
 
     dom.tbody.innerHTML = filtered
       .map((item) => {
-        // Did quantity increase recently?
-        const prevAtp = state.previousCounts[item.sku_code];
-        const isRecentlyUpdated =
-          prevAtp !== undefined && item.atp_qty > prevAtp && state.previousCounts !== {};
+        // Did quantity increase recently from scanner tab?
+        const isRecentlyUpdated = state.updatedSkus && state.updatedSkus.has(item.sku_code);
         const flashClass = isRecentlyUpdated ? "row-updated-flash" : "";
+        const delta = state.updatedDeltas ? state.updatedDeltas[item.sku_code] : null;
 
         return `
           <tr class="hover:bg-slate-700/40 transition-colors ${flashClass}" data-sku="${item.sku_code}">
             <!-- SKU Code -->
             <td class="py-3 px-4 font-mono font-bold text-xs text-white">
-              <span class="bg-slate-900 px-2 py-1 rounded border border-slate-700">${item.sku_code}</span>
+              <span class="bg-slate-900 px-2.5 py-1 rounded-md border border-slate-700 inline-block">${item.sku_code}</span>
             </td>
 
             <!-- Item Name & Category -->
@@ -209,9 +261,16 @@
 
             <!-- Available-To-Promise (ATP) - HERO COLUMN -->
             <td class="py-3 px-4 text-right">
-              <span class="text-base sm:text-lg font-black font-mono text-emerald-400 tracking-tight">
-                ${item.atp_qty}
-              </span>
+              <div class="flex items-center justify-end gap-1.5 flex-wrap">
+                ${
+                  delta
+                    ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-black font-mono bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 animate-pulse">+${delta} PO</span>`
+                    : ""
+                }
+                <span class="text-base sm:text-lg font-black font-mono text-emerald-400 tracking-tight">
+                  ${item.atp_qty}
+                </span>
+              </div>
               <span class="text-[10px] text-emerald-500/80 block font-semibold leading-none">${item.unit || "pcs"} ATP</span>
             </td>
 
@@ -219,7 +278,7 @@
             <td class="py-3 px-3 text-right font-mono">
               ${
                 item.quarantine_qty > 0
-                  ? `<span class="px-2 py-0.5 rounded text-xs font-bold bg-amber-950/80 text-amber-400 border border-amber-500/50">${item.quarantine_qty} ${item.unit}</span>`
+                  ? `<span class="px-2 py-0.5 rounded text-xs font-bold bg-amber-950/80 text-amber-400 border border-amber-500/50" title="Held in Bay GL-DK-9900">${item.quarantine_qty} ${item.unit}</span>`
                   : `<span class="text-slate-500 text-xs">0</span>`
               }
             </td>
@@ -256,6 +315,17 @@
       };
     }
 
+    if (dom.btnClearSearch) {
+      dom.btnClearSearch.onclick = () => {
+        state.searchQuery = "";
+        if (dom.searchInput) {
+          dom.searchInput.value = "";
+          dom.searchInput.focus();
+        }
+        renderTable();
+      };
+    }
+
     if (dom.categoryFilter) {
       dom.categoryFilter.onchange = (e) => {
         state.selectedCategory = e.target.value;
@@ -286,6 +356,40 @@
         }
       };
     }
+
+    // Language Toggle Buttons in Counter Header
+    document.querySelectorAll('[data-action="set-lang"]').forEach((btn) => {
+      btn.onclick = () => {
+        const lang = btn.getAttribute("data-lang");
+        if (lang && window.I18n && typeof window.I18n.setLanguage === "function") {
+          window.I18n.setLanguage(lang);
+        }
+      };
+    });
+
+    // Keyboard Shortcuts (Press '/' to search, 'Esc' to clear, 'r' to refresh)
+    document.addEventListener("keydown", (e) => {
+      const activeTag = document.activeElement ? document.activeElement.tagName.toLowerCase() : "";
+      if (e.key === "/" && activeTag !== "input" && activeTag !== "textarea" && activeTag !== "select") {
+        e.preventDefault();
+        if (dom.searchInput) {
+          dom.searchInput.focus();
+          dom.searchInput.select();
+        }
+      } else if (e.key === "Escape" && activeTag === "input") {
+        if (dom.searchInput) {
+          dom.searchInput.value = "";
+          dom.searchInput.blur();
+        }
+        state.searchQuery = "";
+        renderTable();
+      } else if ((e.key === "r" || e.key === "R") && activeTag !== "input" && activeTag !== "textarea") {
+        if (!e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          fetchInventory();
+        }
+      }
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -296,6 +400,13 @@
     cacheDom();
     attachEvents();
     fetchInventory();
+
+    // Re-render when language switches
+    if (window.I18n && typeof window.I18n.onLanguageChange === "function") {
+      window.I18n.onLanguageChange(() => {
+        renderTable();
+      });
+    }
 
     // Cross-tab broadcast channel listener: Auto-updates when goods are confirmed in scanner tab!
     if (window.Api && window.Api.onStateChange) {

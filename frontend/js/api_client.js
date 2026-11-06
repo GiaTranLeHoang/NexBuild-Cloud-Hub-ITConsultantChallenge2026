@@ -56,6 +56,18 @@
         notifyStateChange();
       }
     });
+
+    // Auto-refresh when tab regains focus or visibility after background throttling
+    window.addEventListener("focus", () => {
+      notifyStateChange();
+    });
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          notifyStateChange();
+        }
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -531,6 +543,18 @@
           };
           return errorObj;
         }
+        // In Live Mode: broadcast state changes across tabs when inventory-affecting actions succeed
+        if (resp.ok && (path.includes("/confirm-receipt") || path.includes("/reset-demo"))) {
+          if (channel) {
+            try {
+              channel.postMessage({ type: "state_change" });
+            } catch (e) {
+              console.warn("[Api] BroadcastChannel postMessage error:", e);
+            }
+          }
+          notifyStateChange();
+        }
+
         return data;
       } catch (err) {
         console.warn(

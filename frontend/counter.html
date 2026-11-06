@@ -39,13 +39,33 @@
 
     /* Flash highlight when inventory row updates in real time */
     @keyframes flashUpdated {
-      0% { background-color: rgba(234, 88, 12, 0.25); }
-      50% { background-color: rgba(16, 185, 129, 0.2); }
-      100% { background-color: transparent; }
+      0% {
+        background-color: rgba(234, 88, 12, 0.35);
+        box-shadow: inset 4px 0 0 #ea580c;
+      }
+      50% {
+        background-color: rgba(16, 185, 129, 0.3);
+        box-shadow: inset 4px 0 0 #10b981;
+      }
+      100% {
+        background-color: transparent;
+        box-shadow: none;
+      }
     }
 
     .row-updated-flash {
-      animation: flashUpdated 2s ease-out forwards;
+      animation: flashUpdated 2.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+
+    /* Skeleton shimmer for Zero Cumulative Layout Shift (Zero CLS) */
+    @keyframes shimmerPulse {
+      0% { opacity: 0.35; }
+      50% { opacity: 0.75; }
+      100% { opacity: 0.35; }
+    }
+
+    .skeleton-shimmer {
+      animation: shimmerPulse 1.4s ease-in-out infinite;
     }
 
     /* Custom scrollbar */
@@ -84,23 +104,33 @@
         </div>
         <div>
           <div class="flex items-center gap-2 flex-wrap">
-            <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">DK-Aarhus-01 &bull; Store Counter</h1>
-            <span class="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-slate-700 text-slate-300 border border-slate-600">Sales Desk 01</span>
+            <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight" data-i18n="storeCounterTitle">DK-Aarhus-01 &bull; Store Counter</h1>
+            <span class="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-slate-700 text-slate-300 border border-slate-600" data-i18n="salesDesk">Sales Desk 01</span>
             <span id="live-indicator" class="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/50">
               <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              <span>Live Hub Sync</span>
+              <span data-i18n="liveHubSync">Live Hub Sync</span>
             </span>
           </div>
-          <p class="text-xs text-slate-400 font-medium">Real-Time Available-To-Promise (ATP) & On-Hand Inventory Lookup</p>
+          <p class="text-xs text-slate-400 font-medium" data-i18n="storeCounterSub">Real-Time Available-To-Promise (ATP) & On-Hand Inventory Lookup</p>
         </div>
       </div>
 
       <div class="flex items-center gap-2.5 flex-wrap">
+        <!-- Zero-Reload Language Selector -->
+        <div class="flex items-center bg-slate-900/90 rounded-xl p-1 border border-slate-700">
+          <button type="button" data-action="set-lang" data-lang="en"
+            class="px-2 py-1 text-xs font-bold rounded text-slate-300 hover:text-white transition">EN</button>
+          <button type="button" data-action="set-lang" data-lang="da"
+            class="px-2 py-1 text-xs font-bold rounded text-slate-300 hover:text-white transition">DA</button>
+          <button type="button" data-action="set-lang" data-lang="vi"
+            class="px-2 py-1 text-xs font-bold rounded text-slate-300 hover:text-white transition">VI</button>
+        </div>
+
         <!-- Link to Mobile Scanner in new tab for dual-screen demo testing -->
         <a href="index.html" target="_blank"
           class="min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 active:scale-95 text-slate-200 text-xs font-bold border border-slate-600 flex items-center gap-2 transition shadow-sm">
           <span>📦</span>
-          <span>Open Scanner Tab</span>
+          <span data-i18n="openScannerTab">Open Scanner Tab</span>
           <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
         </a>
 
@@ -110,7 +140,7 @@
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
           </svg>
-          <span class="hidden sm:inline">Refresh</span>
+          <span class="hidden sm:inline" data-i18n="refresh">Refresh</span>
         </button>
 
         <!-- Mode Toggle -->
@@ -122,7 +152,7 @@
         <!-- Reset Demo Data -->
         <button id="btn-reset-demo" type="button"
           class="min-h-[44px] px-3 py-2 rounded-xl bg-rose-950/70 hover:bg-rose-900 text-rose-300 text-xs font-bold border border-rose-800/80 transition active:scale-95">
-          Reset Demo
+          <span data-i18n="resetDemo">Reset Demo</span>
         </button>
       </div>
     </header>
@@ -169,13 +199,17 @@
     <!-- Search, Filters, and Customer Promise Calculator -->
     <section class="bg-slate-800/90 rounded-2xl border border-slate-700/80 p-4 sm:p-5 shadow-lg space-y-3.5">
       <div class="flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
-        <!-- Search Input -->
+        <!-- Search Input with Keyboard Shortcut & Clear Button -->
         <div class="relative flex-1 max-w-lg">
           <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
           </div>
-          <input type="text" id="search-input" placeholder="Search SKU code, item description, aisle..."
-            class="w-full pl-10 pr-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition">
+          <input type="text" id="search-input" placeholder="Search SKU code, item description, aisle... (Press '/' to focus)"
+            class="w-full pl-10 pr-9 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition">
+          <button id="btn-clear-search" type="button" aria-label="Clear search" title="Clear search (Esc)"
+            class="hidden absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-white transition">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+          </button>
         </div>
 
         <!-- Category Dropdown Filter -->
@@ -199,35 +233,38 @@
         </div>
       </div>
 
-      <!-- Quick Promise Checker for Counter Staff -->
-      <div class="p-3 bg-slate-900/80 rounded-xl border border-slate-700/60 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
-        <div class="flex items-center gap-2 text-slate-300">
-          <span class="text-sm">⚡</span>
-          <span><strong>Counter Fast-Promise Rule:</strong> Items with <span class="text-emerald-400 font-bold">GREEN trust badge</span> updated &lt;15 mins ago can be committed directly to walk-in trade customers without phone verification.</span>
+      <!-- Quick Promise Checker & Dual-Screen Demo Banner -->
+      <div class="p-3 bg-gradient-to-r from-orange-950/30 via-slate-900/90 to-emerald-950/30 rounded-xl border border-slate-700/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-inner">
+        <div class="flex items-center gap-2.5 text-slate-300">
+          <span class="w-6 h-6 rounded-lg bg-orange-600/20 text-orange-400 border border-orange-500/30 flex items-center justify-center font-bold text-xs shrink-0">⚡</span>
+          <span><strong>Counter Fast-Promise Rule:</strong> Items with <span class="text-emerald-400 font-bold">GREEN trust badge</span> (&lt;15m) can be committed directly to walk-in contractors without phone calls.</span>
         </div>
-        <span id="last-sync-time" class="text-[11px] text-slate-400 font-mono shrink-0">Last Synced: Just now</span>
+        <div class="flex items-center gap-2 shrink-0">
+          <span id="sku-count-badge" class="px-2.5 py-1 rounded-md text-[11px] font-mono font-bold bg-slate-800 text-slate-300 border border-slate-700">Showing 15 of 15 SKUs</span>
+          <span id="last-sync-time" class="text-[11px] text-emerald-400 font-mono font-semibold shrink-0">Sync: Just now</span>
+        </div>
       </div>
     </section>
 
-    <!-- Main Inventory Data Table -->
+    <!-- Main Inventory Data Table with Sticky Header & Zero-CLS Sizing -->
     <main class="bg-slate-800/90 rounded-2xl border border-slate-700/80 shadow-2xl overflow-hidden flex flex-col">
-      <div class="overflow-x-auto">
+      <div class="overflow-x-auto overflow-y-auto max-h-[620px] xl:max-h-[700px]">
         <table class="w-full text-left text-xs sm:text-sm border-collapse">
-          <thead>
-            <tr class="bg-slate-900/90 border-b border-slate-700 text-slate-400 text-[11px] font-bold uppercase tracking-wider">
-              <th class="py-3 px-4">SKU / Code</th>
-              <th class="py-3 px-4">Item Description</th>
-              <th class="py-3 px-3">Location</th>
-              <th class="py-3 px-3 text-right">Physical On-Hand</th>
-              <th class="py-3 px-4 text-right text-emerald-400 font-black">Available-To-Promise (ATP)</th>
-              <th class="py-3 px-3 text-right">Quarantine</th>
-              <th class="py-3 px-3 text-center">Trust Status</th>
-              <th class="py-3 px-4 text-right">Last Updated</th>
+          <thead class="sticky top-0 z-20 bg-slate-900/95 backdrop-blur-md border-b border-slate-700 shadow-sm">
+            <tr class="text-slate-400 text-[11px] font-bold uppercase tracking-wider">
+              <th class="py-3 px-4 min-w-[120px]" data-i18n="colSku">SKU Code</th>
+              <th class="py-3 px-4 min-w-[240px]" data-i18n="colDescription">Description</th>
+              <th class="py-3 px-3 min-w-[150px]" data-i18n="colLocation">Location</th>
+              <th class="py-3 px-3 min-w-[120px] text-right" data-i18n="colPhysical">Physical On-Hand</th>
+              <th class="py-3 px-4 min-w-[160px] text-right text-emerald-400 font-black" data-i18n="colAtp">Available-To-Promise (ATP)</th>
+              <th class="py-3 px-3 min-w-[110px] text-right" data-i18n="colQuarantine">Quarantine</th>
+              <th class="py-3 px-3 min-w-[130px] text-center" data-i18n="colTrust">Trust Status</th>
+              <th class="py-3 px-4 min-w-[110px] text-right" data-i18n="colLastUpdated">Last Updated</th>
             </tr>
           </thead>
           <tbody id="inventory-tbody" class="divide-y divide-slate-700/60 text-slate-200">
             <tr>
-              <td colspan="8" class="text-center py-10 text-slate-400">Loading real-time Denmark Hub inventory...</td>
+              <td colspan="8" class="text-center py-10 text-slate-400" data-i18n="loadingInventory">Loading real-time Denmark Hub inventory...</td>
             </tr>
           </tbody>
         </table>
@@ -241,7 +278,8 @@
 
   </div>
 
-  <!-- Modular Scripts -->
+  <!-- Modular Scripts: i18n first, API client, then counter app -->
+  <script src="js/i18n.js"></script>
   <script src="js/api_client.js"></script>
   <script src="js/counter_app.js"></script>
 

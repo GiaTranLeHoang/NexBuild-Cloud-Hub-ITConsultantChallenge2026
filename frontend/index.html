@@ -187,13 +187,18 @@
             }
         }
 
-        /* Mobile safe-area insets */
+        /* Mobile safe-area insets & scroll lock */
         .safe-bottom {
-            padding-bottom: max(0.85rem, env(safe-area-inset-bottom));
+            padding-bottom: max(1rem, env(safe-area-inset-bottom));
         }
 
         .safe-top {
-            padding-top: max(0.5rem, env(safe-area-inset-top));
+            padding-top: max(0.75rem, env(safe-area-inset-top));
+        }
+
+        .modal-open-scroll-lock {
+            overflow: hidden !important;
+            touch-action: none !important;
         }
 
         /* Custom scrollbar styling */
@@ -229,26 +234,20 @@
 
 <body class="min-h-screen bg-slate-900 text-slate-900 overflow-x-hidden">
 
-    <!-- Desktop Three-Zone Presentation Layout (>=1024px):
-       - Left: Live Demo Guide & Caption notes
-       - Center: Mobile Scanner Phone Shell (390x844)
-       - Right: Live Event Log Timeline with timestamps
-       - Between 640-1023px: Centered phone column only
-       - <640px: Edge-to-edge full bleed
-  -->
+    <!-- Desktop Presentation Wrapper (Presenter chrome isolated to large screens >=1024px) -->
     <div
-        class="min-h-screen w-full flex items-start justify-center p-0 sm:p-4 lg:py-6 lg:px-6 gap-6 xl:gap-8 overflow-x-hidden">
+        class="demo-wrapper min-h-screen w-full flex items-start justify-center p-0 sm:p-4 lg:py-6 lg:px-6 gap-6 xl:gap-8 overflow-x-hidden">
 
-        <!-- LEFT SIDE PANEL (Desktop >=1024px, read-only glanceable live demo guide) -->
+        <!-- LEFT PRESENTER PANEL (Desktop >=1024px, read-only glanceable live demo guide) -->
         <aside id="desktop-guide-panel"
             class="hidden lg:flex flex-col w-[290px] xl:w-[330px] shrink-0 sticky top-6 self-start space-y-4"
             aria-live="polite">
             <!-- Injected dynamically by scanner_app.js -->
         </aside>
 
-        <!-- CENTER MOBILE APP CONTAINER -->
+        <!-- CENTER MOBILE SCANNER CONTAINER (Strict Mobile Phone Dimensions & 100dvh Resilient Viewport) -->
         <div id="scanner-app"
-            class="w-full max-w-full sm:max-w-[430px] min-h-screen sm:min-h-[844px] sm:max-h-[890px] bg-slate-50 text-slate-900 sm:rounded-[36px] sm:shadow-2xl sm:border sm:border-slate-800 flex flex-col relative overflow-hidden shrink-0 transition-all">
+            class="mobile-scanner-view w-full max-w-md min-h-[100dvh] h-[100dvh] sm:h-auto sm:min-h-[844px] sm:max-h-[890px] bg-slate-50 text-slate-900 sm:rounded-[36px] sm:shadow-2xl sm:border-2 sm:border-slate-800 flex flex-col relative overflow-hidden shrink-0 transition-all">
 
             <!-- Top Bar Component -->
             <div id="top-bar" class="shrink-0 safe-top"></div>
@@ -273,7 +272,10 @@
 
         </div>
 
-        <!-- RIGHT SIDE PANEL (Desktop >=1024px, live event log timeline with timestamps) -->
+        <!-- Hidden file input for real camera/file OCR upload (wired by scanner_app.js) -->
+        <input type="file" id="ocrFileInput" accept="image/*" capture="environment" class="hidden">
+
+        <!-- RIGHT PRESENTER PANEL (Desktop >=1024px, live event log timeline with data badges) -->
         <aside id="desktop-event-log-panel"
             class="hidden lg:flex flex-col w-[290px] xl:w-[330px] shrink-0 sticky top-6 self-start space-y-4"
             aria-live="polite">
