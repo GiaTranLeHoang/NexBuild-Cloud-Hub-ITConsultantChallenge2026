@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en" class="overflow-x-hidden">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NexBuild Store Counter - Read-Only ATP Lookup</title>
+
+  <!-- Typography: Plus Jakarta Sans with system fallback -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <!-- Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Custom Design Tokens, Table Utilities & Pulse Highlights -->
+  <style>
+    :root {
+      --font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      --color-concrete-surface: #f8fafc;
+      --color-concrete-card: #ffffff;
+      --color-concrete-border: #e2e8f0;
+      --color-ink-primary: #0f172a;
+      --color-ink-secondary: #475569;
+      --color-brand-accent: #ea580c; /* Industrial Safety Orange */
+      --color-status-ok: #059669;
+      --color-status-short: #d97706;
+      --color-status-unknown: #dc2626;
+    }
+
+    html, body {
+      font-family: var(--font-family);
+      background-color: #0b111e;
+      color: var(--color-ink-primary);
+      overflow-x: hidden;
+      max-width: 100vw;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /* Flash highlight when inventory row updates in real time */
+    @keyframes flashUpdated {
+      0% { background-color: rgba(234, 88, 12, 0.25); }
+      50% { background-color: rgba(16, 185, 129, 0.2); }
+      100% { background-color: transparent; }
+    }
+
+    .row-updated-flash {
+      animation: flashUpdated 2s ease-out forwards;
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+
+    /* Focus visible */
+    button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid var(--color-brand-accent);
+      outline-offset: 2px;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-900 text-slate-100 flex flex-col">
+
+  <!-- Desktop App Container -->
+  <div id="counter-app" class="flex-1 flex flex-col w-full max-w-7xl mx-auto p-3 sm:p-6 lg:p-8 space-y-5">
+    
+    <!-- Top Navigation & Desk Header -->
+    <header class="bg-slate-800/90 backdrop-blur-md rounded-2xl border border-slate-700/80 p-4 sm:p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-4 shadow-xl">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-xl bg-orange-600 flex items-center justify-center font-black text-lg tracking-tighter text-white shadow-md shrink-0">
+          NB
+        </div>
+        <div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <h1 class="text-base sm:text-lg font-extrabold text-white tracking-tight">DK-Aarhus-01 &bull; Store Counter</h1>
+            <span class="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-slate-700 text-slate-300 border border-slate-600">Sales Desk 01</span>
+            <span id="live-indicator" class="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-950/80 text-emerald-400 border border-emerald-500/50">
+              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+              <span>Live Hub Sync</span>
+            </span>
+          </div>
+          <p class="text-xs text-slate-400 font-medium">Real-Time Available-To-Promise (ATP) & On-Hand Inventory Lookup</p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2.5 flex-wrap">
+        <!-- Link to Mobile Scanner in new tab for dual-screen demo testing -->
+        <a href="index.html" target="_blank"
+          class="min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 active:scale-95 text-slate-200 text-xs font-bold border border-slate-600 flex items-center gap-2 transition shadow-sm">
+          <span>📦</span>
+          <span>Open Scanner Tab</span>
+          <svg class="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+        </a>
+
+        <!-- Manual refresh button -->
+        <button id="btn-refresh" type="button" aria-label="Refresh inventory"
+          class="min-h-[44px] min-w-[44px] px-3 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 active:scale-95 text-slate-200 text-xs font-bold border border-slate-600 flex items-center justify-center gap-1.5 transition">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+          </svg>
+          <span class="hidden sm:inline">Refresh</span>
+        </button>
+
+        <!-- Mode Toggle -->
+        <button id="btn-mode-toggle" type="button"
+          class="min-h-[44px] px-3 py-2 rounded-xl text-xs font-bold border transition active:scale-95 shadow-sm bg-indigo-950/80 text-indigo-300 border-indigo-500/40 hover:bg-indigo-900/60">
+          Mode: MOCK
+        </button>
+
+        <!-- Reset Demo Data -->
+        <button id="btn-reset-demo" type="button"
+          class="min-h-[44px] px-3 py-2 rounded-xl bg-rose-950/70 hover:bg-rose-900 text-rose-300 text-xs font-bold border border-rose-800/80 transition active:scale-95">
+          Reset Demo
+        </button>
+      </div>
+    </header>
+
+    <!-- KPI Metric Summary Tiles -->
+    <section class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+      <!-- Total SKUs -->
+      <div class="bg-slate-800/80 rounded-2xl p-4 border border-slate-700/70 shadow-md">
+        <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">Catalog SKUs</span>
+        <div class="flex items-baseline justify-between mt-1">
+          <span id="metric-total-skus" class="text-2xl sm:text-3xl font-black text-white font-mono">15</span>
+          <span class="text-xs text-slate-400 font-semibold">Active in Hub</span>
+        </div>
+      </div>
+
+      <!-- Total Sellable ATP -->
+      <div class="bg-slate-800/80 rounded-2xl p-4 border border-slate-700/70 shadow-md">
+        <span class="text-[11px] font-bold uppercase tracking-wider text-emerald-400 block">Sellable ATP Stock</span>
+        <div class="flex items-baseline justify-between mt-1">
+          <span id="metric-total-atp" class="text-2xl sm:text-3xl font-black text-emerald-400 font-mono">...</span>
+          <span class="text-xs text-emerald-500/90 font-semibold">Available</span>
+        </div>
+      </div>
+
+      <!-- Quarantined Units -->
+      <div class="bg-slate-800/80 rounded-2xl p-4 border border-slate-700/70 shadow-md">
+        <span class="text-[11px] font-bold uppercase tracking-wider text-amber-400 block">Quarantined Stock</span>
+        <div class="flex items-baseline justify-between mt-1">
+          <span id="metric-quarantine" class="text-2xl sm:text-3xl font-black text-amber-400 font-mono">...</span>
+          <span class="text-xs text-amber-500/90 font-semibold">Bay GL-DK-9900</span>
+        </div>
+      </div>
+
+      <!-- Trust Health -->
+      <div class="bg-slate-800/80 rounded-2xl p-4 border border-slate-700/70 shadow-md">
+        <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">Data Freshness</span>
+        <div class="flex items-baseline justify-between mt-1">
+          <span id="metric-trust-health" class="text-2xl sm:text-3xl font-black text-emerald-400 font-mono">100%</span>
+          <span class="text-xs text-emerald-400 font-semibold">&lt;15m (Green)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Search, Filters, and Customer Promise Calculator -->
+    <section class="bg-slate-800/90 rounded-2xl border border-slate-700/80 p-4 sm:p-5 shadow-lg space-y-3.5">
+      <div class="flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
+        <!-- Search Input -->
+        <div class="relative flex-1 max-w-lg">
+          <div class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+          </div>
+          <input type="text" id="search-input" placeholder="Search SKU code, item description, aisle..."
+            class="w-full pl-10 pr-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-xs sm:text-sm text-white placeholder-slate-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition">
+        </div>
+
+        <!-- Category Dropdown Filter -->
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-slate-400 font-medium shrink-0">Category:</span>
+          <select id="category-filter"
+            class="min-h-[42px] px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-xs font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 transition">
+            <option value="">All Categories (15 SKUs)</option>
+            <option value="Heavy Building">Heavy Building</option>
+            <option value="Timber & Joinery">Timber & Joinery</option>
+            <option value="Drywall & Board">Drywall & Board</option>
+            <option value="Insulation">Insulation</option>
+            <option value="Masonry">Masonry</option>
+            <option value="Aggregates">Aggregates</option>
+            <option value="Steel & Reinforcement">Steel & Reinforcement</option>
+            <option value="Sheet Materials">Sheet Materials</option>
+            <option value="Fixings & Fasteners">Fixings & Fasteners</option>
+            <option value="Roofing">Roofing</option>
+            <option value="Decorating & Chemicals">Decorating & Chemicals</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Quick Promise Checker for Counter Staff -->
+      <div class="p-3 bg-slate-900/80 rounded-xl border border-slate-700/60 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+        <div class="flex items-center gap-2 text-slate-300">
+          <span class="text-sm">⚡</span>
+          <span><strong>Counter Fast-Promise Rule:</strong> Items with <span class="text-emerald-400 font-bold">GREEN trust badge</span> updated &lt;15 mins ago can be committed directly to walk-in trade customers without phone verification.</span>
+        </div>
+        <span id="last-sync-time" class="text-[11px] text-slate-400 font-mono shrink-0">Last Synced: Just now</span>
+      </div>
+    </section>
+
+    <!-- Main Inventory Data Table -->
+    <main class="bg-slate-800/90 rounded-2xl border border-slate-700/80 shadow-2xl overflow-hidden flex flex-col">
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-xs sm:text-sm border-collapse">
+          <thead>
+            <tr class="bg-slate-900/90 border-b border-slate-700 text-slate-400 text-[11px] font-bold uppercase tracking-wider">
+              <th class="py-3 px-4">SKU / Code</th>
+              <th class="py-3 px-4">Item Description</th>
+              <th class="py-3 px-3">Location</th>
+              <th class="py-3 px-3 text-right">Physical On-Hand</th>
+              <th class="py-3 px-4 text-right text-emerald-400 font-black">Available-To-Promise (ATP)</th>
+              <th class="py-3 px-3 text-right">Quarantine</th>
+              <th class="py-3 px-3 text-center">Trust Status</th>
+              <th class="py-3 px-4 text-right">Last Updated</th>
+            </tr>
+          </thead>
+          <tbody id="inventory-tbody" class="divide-y divide-slate-700/60 text-slate-200">
+            <tr>
+              <td colspan="8" class="text-center py-10 text-slate-400">Loading real-time Denmark Hub inventory...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="text-center text-xs text-slate-500 py-2">
+      NexBuild Cloud Hub &bull; Denmark Phase 1 MVP (Round 2 Build-a-thon) &bull; Store DK-Aarhus-01
+    </footer>
+
+  </div>
+
+  <!-- Modular Scripts -->
+  <script src="js/api_client.js"></script>
+  <script src="js/counter_app.js"></script>
+
+</body>
+</html>
+
