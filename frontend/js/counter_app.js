@@ -25,6 +25,17 @@
     loading: false,
   };
 
+  // Safe HTML Escaping (QA D1-04 Stored XSS Prevention)
+  function escapeHtml(value) {
+    if (value === null || value === undefined) return "";
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
   // DOM Mount Points
   let dom = {};
 
@@ -237,26 +248,26 @@
         const delta = state.updatedDeltas ? state.updatedDeltas[item.sku_code] : null;
 
         return `
-          <tr class="hover:bg-slate-700/40 transition-colors ${flashClass}" data-sku="${item.sku_code}">
+          <tr class="hover:bg-slate-700/40 transition-colors ${flashClass}" data-sku="${escapeHtml(item.sku_code)}">
             <!-- SKU Code -->
             <td class="py-3 px-4 font-mono font-bold text-xs text-white">
-              <span class="bg-slate-900 px-2.5 py-1 rounded-md border border-slate-700 inline-block">${item.sku_code}</span>
+              <span class="bg-slate-900 px-2.5 py-1 rounded-md border border-slate-700 inline-block">${escapeHtml(item.sku_code)}</span>
             </td>
 
             <!-- Item Name & Category -->
             <td class="py-3 px-4">
-              <div class="font-bold text-white leading-snug">${item.item_name}</div>
-              <div class="text-[11px] text-slate-400 font-medium">${item.category || "General"}</div>
+              <div class="font-bold text-white leading-snug">${escapeHtml(item.item_name)}</div>
+              <div class="text-[11px] text-slate-400 font-medium">${escapeHtml(item.category || "General")}</div>
             </td>
 
             <!-- Location -->
             <td class="py-3 px-3 text-xs text-slate-300 font-mono">
-              ${item.location || "Receiving Staging"}
+              ${escapeHtml(item.location || "Receiving Staging")}
             </td>
 
             <!-- Physical On-Hand -->
             <td class="py-3 px-3 text-right font-mono font-bold text-slate-200">
-              ${item.physical_on_hand} <span class="text-[10px] text-slate-400 font-normal">${item.unit || "pcs"}</span>
+              ${item.physical_on_hand} <span class="text-[10px] text-slate-400 font-normal">${escapeHtml(item.unit || "pcs")}</span>
             </td>
 
             <!-- Available-To-Promise (ATP) - HERO COLUMN -->
@@ -271,14 +282,14 @@
                   ${item.atp_qty}
                 </span>
               </div>
-              <span class="text-[10px] text-emerald-500/80 block font-semibold leading-none">${item.unit || "pcs"} ATP</span>
+              <span class="text-[10px] text-emerald-500/80 block font-semibold leading-none">${escapeHtml(item.unit || "pcs")} ATP</span>
             </td>
 
             <!-- Quarantine -->
             <td class="py-3 px-3 text-right font-mono">
               ${
                 item.quarantine_qty > 0
-                  ? `<span class="px-2 py-0.5 rounded text-xs font-bold bg-amber-950/80 text-amber-400 border border-amber-500/50" title="Held in Bay GL-DK-9900">${item.quarantine_qty} ${item.unit}</span>`
+                  ? `<span class="px-2 py-0.5 rounded text-xs font-bold bg-amber-950/80 text-amber-400 border border-amber-500/50" title="Held in Bay GL-DK-9900">${item.quarantine_qty} ${escapeHtml(item.unit || "pcs")}</span>`
                   : `<span class="text-slate-500 text-xs">0</span>`
               }
             </td>

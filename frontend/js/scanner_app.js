@@ -64,12 +64,40 @@
     }
   }
 
+  // Safe HTML Escaping (QA D1-04 Stored XSS Prevention)
+  function escapeHtml(value) {
+    if (value === null || value === undefined) return "";
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  // Robust Error Message Extractor (QA D0-06 [object Object] Prevention)
+  function formatErrorMessage(err) {
+    if (!err) return "Unknown error occurred";
+    if (typeof err === "string") return err;
+    if (err.message && typeof err.message === "string") return err.message;
+    if (typeof err.detail === "string") return err.detail;
+    if (err.detail && typeof err.detail === "object") {
+      if (typeof err.detail.message === "string") return err.detail.message;
+      if (err.detail.error_code) return `${err.detail.error_code}: ${err.detail.message || "Operation failed"}`;
+      try { return JSON.stringify(err.detail); } catch (e) {}
+    }
+    if (err.error_code) return `${err.error_code}: ${err.message || "Operation failed"}`;
+    try { return JSON.stringify(err); } catch (e) { return String(err); }
+  }
+
   // Application State
   const state = {
     step: 1, // 1 = Scan, 2 = Match to PO, 3 = Confirmation / Queue View
     isOnline: true,
     offlineQueue: loadOfflineQueue(),
     mode: window.Api ? window.Api.getMode() : "mock",
+    isRealOcr: false,
+    isDemoFallback: false,
 
     // Stage 3b Creative Toggles
     phoneFrame: getBoolPref(PREF_PHONE_FRAME, true), // default ON (framed phone)
@@ -196,6 +224,8 @@
       }
 
       state.scanResult = result;
+      state.isRealOcr = false;
+      state.isDemoFallback = true; // Demo scan always uses deterministic mock
       const rawLines = result.lines || result.items || [];
       const plastLine = rawLines.find((l) => l.sku_code === "PLAST-01");
       if (plastLine && plastLine.match_status === "SHORT") {
@@ -242,9 +272,10 @@
       clearTimeout(t1);
       clearTimeout(t2);
       state.isScanning = false;
-      state.errorMessage = err.message || "Network / OCR error occurred. Please try again.";
+      const errMsg = formatErrorMessage(err) || "Network / OCR error occurred. Please try again.";
+      state.errorMessage = errMsg;
       if (Fx.vibrateError) Fx.vibrateError();
-      addEventLog(`Scan failed: ${err.message}`, "error");
+      addEventLog(`Scan failed: ${errMsg}`, "error");
       render();
     }
   }
@@ -262,7 +293,7 @@
     render();
 
     const t1 = setTimeout(() => {
-      state.scanProgressText = "Processing with Gemini 1.5 Flash Vision... (3-5s)";
+      state.scanProgressText = "Processing with Gemini Vision API... (3-5s)";
       render();
     }, 800);
 
@@ -277,10 +308,16 @@
       clearTimeout(t2);
 
       if (result.status === "error") {
-        throw new Error(result.message || "AI OCR failed");
+        throw new Error(formatErrorMessage(result) || "AI OCR failed");
       }
 
       state.scanResult = result;
+      state.isRealOcr = true;
+      state.isDemoFallback = Boolean(
+        result.is_demo_fallback ||
+        result.is_fallback ||
+        (result.ocr_engine && result.ocr_engine.includes("Fallback"))
+      );
       const rawLines = result.lines || result.items || [];
       const plastLine = rawLines.find((l) => l.sku_code === "PLAST-01");
       if (plastLine && plastLine.match_status === "SHORT") {
@@ -304,7 +341,12 @@
       state.activeCaption = "AI scan complete — review matched lines below";
 
       if (Fx.vibrateScanComplete) Fx.vibrateScanComplete();
-      addEventLog("Real AI OCR scan complete", "success");
+      addEventLog(
+        state.isDemoFallback
+          ? "AI OCR unavailable — loaded deterministic fallback data"
+          : "Real AI OCR scan complete via Gemini Vision",
+        state.isDemoFallback ? "warning" : "success"
+      );
       render();
 
       setTimeout(() => {
@@ -320,9 +362,10 @@
       clearTimeout(t1);
       clearTimeout(t2);
       state.isScanning = false;
-      state.errorMessage = err.message || "AI OCR error. Please try again or use demo scan.";
+      const errMsg = formatErrorMessage(err) || "AI OCR error. Please try again or use demo scan.";
+      state.errorMessage = errMsg;
       if (Fx.vibrateError) Fx.vibrateError();
-      addEventLog(`Real AI scan failed: ${err.message}`, "error");
+      addEventLog(`Real AI scan failed: ${errMsg}`, "error");
       render();
     }
   }
@@ -462,9 +505,12 @@
 
     const rawLines = state.scanResult ? (state.scanResult.lines || state.scanResult.items || []) : [];
     
-    // Check all unresolved discrepancies across the entire payload
+    // Check all unresolved discrepancies and low-confidence lines (QA D1-05)
     const unresolvedDiscrepancies = rawLines.filter((l) => {
-      const isDisc = l.match_status !== "OK" || (l.ordered_qty !== undefined && l.received_qty !== l.ordered_qty);
+      const isShortOrOver = l.ordered_qty !== undefined && l.received_qty !== l.ordered_qty;
+      const isUnknown = l.match_status === "UNKNOWN_SKU";
+      const isLowConf = (l.confidence_score !== undefined && l.confidence_score < 0.75) || l.low_confidence;
+      const isDisc = l.match_status !== "OK" || isShortOrOver || isUnknown || isLowConf;
       if (!isDisc) return false;
       if (l.sku_code === "PLAST-01") return !state.plastReview.reviewed;
       if (l.sku_code === "FIX-M8") return !state.fixApproved;
@@ -473,7 +519,7 @@
 
     if (unresolvedDiscrepancies.length > 0) {
       const skuList = unresolvedDiscrepancies.map((l) => l.sku_code).join(", ");
-      showToast(`Please review discrepancy for: ${skuList}`);
+      showToast(`Please review discrepancy / low confidence for: ${skuList}`);
       return;
     }
 
@@ -520,8 +566,16 @@
       const res = await window.Api.confirmReceipt(payload);
       const elapsed = ((performance.now() - tStart) / 1000).toFixed(2);
 
-      if (res.status === "error") {
-        throw new Error(res.message || "Server rejected receipt confirmation");
+      // QA D0-02: Honest Network State - Never show success or advance step on failure
+      if (!res || res.status === "error") {
+        state.confirming = false;
+        const msg = formatErrorMessage(res) || "Server rejected receipt confirmation";
+        state.errorMessage = `Failed / Pending Sync: ${msg}`;
+        if (Fx.vibrateError) Fx.vibrateError();
+        addEventLog(`Confirmation failed: ${msg}`, "error");
+        render();
+        showToast(`Confirmation failed: ${msg}`);
+        return;
       }
 
       state.lastElapsedSeconds = elapsed;
@@ -537,10 +591,12 @@
       showToast(t("postedHubTitle", { sec: elapsed }));
     } catch (err) {
       state.confirming = false;
-      state.errorMessage = err.message || "Confirmation failed";
+      const msg = formatErrorMessage(err) || "Confirmation failed";
+      state.errorMessage = `Failed / Pending Sync: ${msg}`;
       if (Fx.vibrateError) Fx.vibrateError();
-      addEventLog(`Confirmation error: ${err.message}`, "error");
+      addEventLog(`Confirmation error: ${msg}`, "error");
       render();
+      showToast(`Confirmation error: ${msg}`);
     }
   }
 
@@ -557,18 +613,20 @@
       const nextItem = state.offlineQueue[0];
       try {
         const res = await window.Api.confirmReceipt(nextItem.payload);
-        if (res.status === "error") {
-          throw new Error(res.message || "Sync failed");
+        if (!res || res.status === "error") {
+          throw new Error(formatErrorMessage(res) || "Sync failed");
         }
+        // QA D0-02: Only remove from queue after successful 200 OK commit
         state.offlineQueue.shift();
         persistOfflineQueue(state.offlineQueue);
         render();
       } catch (err) {
         state.isSyncing = false;
         state.syncMessage = null;
-        state.errorMessage = `Sync paused: ${err.message}. Retrying available.`;
+        const msg = formatErrorMessage(err) || "Sync failed";
+        state.errorMessage = `Sync paused: ${msg}. Retrying available.`;
         if (Fx.vibrateError) Fx.vibrateError();
-        addEventLog(`Sync error: ${err.message}`, "error");
+        addEventLog(`Sync error: ${msg}`, "error");
         render();
         return;
       }
@@ -1076,7 +1134,7 @@
         ${state.errorMessage
         ? `
           <div class="mt-4 p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs flex items-center justify-between">
-            <span>${state.errorMessage}</span>
+            <span>${escapeHtml(state.errorMessage)}</span>
             <button id="btn-dismiss-error" class="font-bold underline ml-2">Dismiss</button>
           </div>
         `
@@ -1109,7 +1167,7 @@
   function renderSpotlightCard(line) {
     const isPlastShort = line.sku_code === "PLAST-01" && line.match_status === "SHORT";
     const isFixUnknown = line.sku_code === "FIX-M8" && line.match_status === "UNKNOWN_SKU";
-    const confPercent = Math.round((line.confidence_score || 0.98) * 100);
+    const confPercent = Math.round((line.confidence_score !== undefined ? line.confidence_score : 0.98) * 100);
 
     // 1. PLAST-01 Short Delivery Card (Only if actually short)
     if (isPlastShort) {
@@ -1123,10 +1181,10 @@
         } p-3.5 shadow-sm transition space-y-2.5" data-sku="PLAST-01" tabindex="0">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0 flex-1">
-              <h4 class="font-bold text-sm text-slate-900 leading-snug">${line.item_name}</h4>
+              <h4 class="font-bold text-sm text-slate-900 leading-snug">${escapeHtml(line.item_name || 'Gyproc Standard Plasterboard')}</h4>
               <div class="flex items-center gap-2 mt-0.5">
-                <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">PLAST-01</span>
-                <span class="text-[11px] text-slate-500">${line.unit || 'sheets'}</span>
+                <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">${escapeHtml(line.sku_code)}</span>
+                <span class="text-[11px] text-slate-500">${escapeHtml(line.unit || 'sheets')}</span>
               </div>
             </div>
             <div class="shrink-0">
@@ -1140,11 +1198,11 @@
               <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider block">${t("deliveredOrdered")}</span>
               <div class="flex items-baseline gap-1 mt-0.5">
                 <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="${recQty}">${recQty}</span>
-                <span class="text-xs font-semibold text-slate-500">/ ${ordQty} ${line.unit || 'sheets'}</span>
+                <span class="text-xs font-semibold text-slate-500">/ ${ordQty} ${escapeHtml(line.unit || 'sheets')}</span>
               </div>
             </div>
             <span class="px-2 py-1 rounded-md text-xs font-black bg-yellow-100 text-yellow-900 border border-yellow-300 whitespace-nowrap">
-              ${shortfall} ${line.unit || 'sheets'} short
+              ${shortfall} ${escapeHtml(line.unit || 'sheets')} short
             </span>
           </div>
 
@@ -1156,7 +1214,7 @@
               </div>
               <span class="font-mono text-[10px] font-semibold text-slate-600">${confPercent}% conf</span>
             </div>
-            <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: line.line_number || "3" })}</span>
+            <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: escapeHtml(String(line.line_number || "3")) })}</span>
           </div>
 
           <!-- Review Trigger Button (Touch target >= 48px) -->
@@ -1184,10 +1242,10 @@
         } p-3.5 shadow-sm transition space-y-2.5" data-sku="FIX-M8" tabindex="0">
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0 flex-1">
-              <h4 class="font-bold text-sm text-slate-900 leading-snug">${line.item_name}</h4>
+              <h4 class="font-bold text-sm text-slate-900 leading-snug">${escapeHtml(line.item_name || 'Heavy Anchors / Fixings')}</h4>
               <div class="flex items-center gap-2 mt-0.5">
                 <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">FIX-M8</span>
-                <span class="text-[11px] text-slate-500">${line.unit || 'boxes'}</span>
+                <span class="text-[11px] text-slate-500">${escapeHtml(line.unit || 'boxes')}</span>
               </div>
             </div>
             <div class="shrink-0">
@@ -1201,7 +1259,7 @@
               <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider block">${t("deliveredOrdered")}</span>
               <div class="flex items-baseline gap-1 mt-0.5">
                 <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="${recQty}">${recQty}</span>
-                <span class="text-xs font-semibold text-slate-500">/ 0 ${line.unit || 'boxes'}</span>
+                <span class="text-xs font-semibold text-slate-500">/ 0 ${escapeHtml(line.unit || 'boxes')}</span>
               </div>
             </div>
             <span class="px-2 py-1 rounded-md text-xs font-black bg-red-100 text-red-900 border border-red-300 whitespace-nowrap">
@@ -1238,51 +1296,51 @@
     }
 
     // 3. General Dynamic Item Card (Strict Mutually Exclusive Badges)
-    const isOk = line.match_status === "OK" && (line.ordered_qty === undefined || line.received_qty === line.ordered_qty);
+    const isReviewed = Boolean(state.reviewedExceptions && state.reviewedExceptions[line.sku_code]);
+    const isLowConf = (line.confidence_score !== undefined && line.confidence_score < 0.75) || Boolean(line.low_confidence);
     const isShort = line.match_status === "SHORT" || (line.ordered_qty !== undefined && line.received_qty < line.ordered_qty);
     const isOver = line.match_status === "OVER" || (line.ordered_qty !== undefined && line.received_qty > line.ordered_qty);
     const isUnknown = line.match_status === "UNKNOWN_SKU";
+    const isOk = line.match_status === "OK" && (line.ordered_qty === undefined || line.received_qty === line.ordered_qty) && !isLowConf;
 
     let badgeHtml = "";
     let varianceChipHtml = "";
     let reviewActionHtml = "";
 
-    const isReviewed = Boolean(state.reviewedExceptions && state.reviewedExceptions[line.sku_code]);
-
     if (isOk) {
       badgeHtml = `<span class="bg-green-100 text-green-800 px-2.5 py-1 rounded-md text-xs font-bold border border-green-200 whitespace-nowrap">100% matched</span>`;
       varianceChipHtml = `<span class="px-2 py-0.5 rounded text-[11px] font-bold text-green-800 bg-green-50 border border-green-200 whitespace-nowrap">Match</span>`;
     } else if (isShort) {
-      badgeHtml = `<span class="bg-yellow-100 text-yellow-800 px-2.5 py-1 rounded-md text-xs font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>`;
       const deficit = (line.received_qty || 0) - (line.ordered_qty || 0);
-      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-yellow-100 text-yellow-900 border border-yellow-300 whitespace-nowrap">${deficit} ${line.unit || ''} short</span>`;
+      badgeHtml = `<span class="bg-yellow-100 text-yellow-800 px-2.5 py-1 rounded-md text-xs font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>`;
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-yellow-100 text-yellow-900 border border-yellow-300 whitespace-nowrap">${deficit} ${escapeHtml(line.unit || '')} short</span>`;
       reviewActionHtml = `
-        <button type="button" data-action="review-general" data-sku="${line.sku_code}"
+        <button type="button" data-action="review-general" data-sku="${escapeHtml(line.sku_code)}"
           class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
             ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
             : "bg-amber-100 hover:bg-amber-200 text-amber-950 border-amber-300"
           }">
           ${isReviewed
             ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
-               <span>Shortage acknowledged (${line.sku_code})</span>`
+               <span>Shortage acknowledged (${escapeHtml(line.sku_code)})</span>`
             : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
-               <span>Review shortage (${line.sku_code})</span>`
+               <span>Review shortage (${escapeHtml(line.sku_code)})</span>`
           }
         </button>
       `;
     } else if (isOver) {
       const surplus = (line.received_qty || 0) - (line.ordered_qty || 0);
       badgeHtml = `<span class="bg-blue-100 text-blue-800 px-2.5 py-1 rounded-md text-xs font-bold border border-blue-200 whitespace-nowrap">OVER (+${surplus})</span>`;
-      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-blue-100 text-blue-900 border border-blue-300 whitespace-nowrap">+${surplus} ${line.unit || ''} surplus</span>`;
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-blue-100 text-blue-900 border border-blue-300 whitespace-nowrap">+${surplus} ${escapeHtml(line.unit || '')} surplus</span>`;
       reviewActionHtml = `
-        <button type="button" data-action="review-general" data-sku="${line.sku_code}"
+        <button type="button" data-action="review-general" data-sku="${escapeHtml(line.sku_code)}"
           class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
             ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
             : "bg-blue-100 hover:bg-blue-200 text-blue-950 border-blue-300"
           }">
           ${isReviewed
             ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
-               <span>Over-delivery accepted (${line.sku_code})</span>`
+               <span>Over-delivery accepted (${escapeHtml(line.sku_code)})</span>`
             : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
                <span>Approve over-delivery (+${surplus})</span>`
           }
@@ -1292,22 +1350,39 @@
       badgeHtml = `<span class="bg-red-100 text-red-800 px-2.5 py-1 rounded-md text-xs font-bold border border-red-200 whitespace-nowrap">UNORDERED SKU</span>`;
       varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-black bg-red-100 text-red-900 border border-red-300 whitespace-nowrap">+${line.received_qty} unordered</span>`;
       reviewActionHtml = `
-        <button type="button" data-action="review-general" data-sku="${line.sku_code}"
+        <button type="button" data-action="review-general" data-sku="${escapeHtml(line.sku_code)}"
           class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
             ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
             : "bg-red-100 hover:bg-red-200 text-red-950 border-red-300"
           }">
           ${isReviewed
             ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
-               <span>Override approved (${line.sku_code})</span>`
+               <span>Override approved (${escapeHtml(line.sku_code)})</span>`
             : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
-               <span>Approve unordered receipt (${line.sku_code})</span>`
+               <span>Approve unordered receipt (${escapeHtml(line.sku_code)})</span>`
+          }
+        </button>
+      `;
+    } else if (isLowConf) {
+      badgeHtml = `<span class="bg-amber-100 text-amber-900 px-2.5 py-1 rounded-md text-xs font-bold border border-amber-300 whitespace-nowrap">LOW CONFIDENCE (${confPercent}%)</span>`;
+      varianceChipHtml = `<span class="px-2 py-0.5 rounded text-[11px] font-bold text-amber-800 bg-amber-50 border border-amber-200 whitespace-nowrap">Verify Qty (${line.received_qty})</span>`;
+      reviewActionHtml = `
+        <button type="button" data-action="review-general" data-sku="${escapeHtml(line.sku_code)}"
+          class="w-full min-h-[44px] py-2 px-3 rounded-lg text-xs font-bold border transition flex items-center justify-center gap-2 active:scale-98 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500 ${isReviewed
+            ? "bg-emerald-600 text-white border-emerald-700 shadow-sm"
+            : "bg-amber-100 hover:bg-amber-200 text-amber-950 border-amber-300"
+          }">
+          ${isReviewed
+            ? `<svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
+               <span>AI reading verified (${escapeHtml(line.sku_code)})</span>`
+            : `<span class="w-4 h-4 rounded-full border-2 border-current flex items-center justify-center text-[10px]">!</span>
+               <span>Verify AI reading (${escapeHtml(line.sku_code)})</span>`
           }
         </button>
       `;
     } else {
-      badgeHtml = `<span class="bg-slate-100 text-slate-800 px-2.5 py-1 rounded-md text-xs font-bold border border-slate-200 whitespace-nowrap">${line.match_status || "PENDING"}</span>`;
-      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-bold text-slate-600 bg-slate-100 border border-slate-200 whitespace-nowrap">${line.match_status || "PENDING"}</span>`;
+      badgeHtml = `<span class="bg-slate-100 text-slate-800 px-2.5 py-1 rounded-md text-xs font-bold border border-slate-200 whitespace-nowrap">${escapeHtml(line.match_status || "PENDING")}</span>`;
+      varianceChipHtml = `<span class="px-2 py-1 rounded-md text-xs font-bold text-slate-600 bg-slate-100 border border-slate-200 whitespace-nowrap">${escapeHtml(line.match_status || "PENDING")}</span>`;
     }
 
     const cardBorderClass = isOk
@@ -1316,16 +1391,18 @@
       ? (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-amber-300 bg-amber-50/20")
       : isOver
       ? (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-blue-300 bg-blue-50/20")
-      : (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-red-300 bg-red-50/20");
+      : isUnknown
+      ? (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-red-300 bg-red-50/20")
+      : (isReviewed ? "border-emerald-300 bg-emerald-50/20" : "border-amber-300 bg-amber-50/20");
 
     return `
-      <article class="rounded-xl border ${cardBorderClass} p-3.5 shadow-sm transition space-y-2.5" data-sku="${line.sku_code}">
+      <article class="rounded-xl border ${cardBorderClass} p-3.5 shadow-sm transition space-y-2.5" data-sku="${escapeHtml(line.sku_code)}">
         <div class="flex items-start justify-between gap-2">
           <div class="min-w-0 flex-1">
-            <h4 class="font-bold text-sm text-slate-900 leading-snug line-clamp-2">${line.item_name}</h4>
+            <h4 class="font-bold text-sm text-slate-900 leading-snug line-clamp-2">${escapeHtml(line.item_name || 'Warehouse SKU')}</h4>
             <div class="flex items-center gap-2 mt-0.5">
-              <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">${line.sku_code}</span>
-              <span class="text-[11px] text-slate-500">${line.unit}</span>
+              <span class="font-mono text-xs font-semibold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">${escapeHtml(line.sku_code)}</span>
+              <span class="text-[11px] text-slate-500">${escapeHtml(line.unit || 'pcs')}</span>
             </div>
           </div>
           <div class="shrink-0">
@@ -1338,7 +1415,7 @@
             <span class="text-[10px] uppercase font-bold text-slate-500 tracking-wider block">${t("deliveredOrdered")}</span>
             <div class="flex items-baseline gap-1 mt-0.5">
               <span class="hero-quantity font-black text-slate-900 tracking-tight font-mono" data-count-target="${line.received_qty}">${line.received_qty}</span>
-              <span class="text-xs font-semibold text-slate-500">/ ${line.ordered_qty || 0} ${line.unit}</span>
+              <span class="text-xs font-semibold text-slate-500">/ ${line.ordered_qty || 0} ${escapeHtml(line.unit || 'pcs')}</span>
             </div>
           </div>
           ${varianceChipHtml}
@@ -1347,11 +1424,11 @@
         <div class="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
           <div class="flex items-center gap-1.5 flex-1 mr-3">
             <div class="w-16 h-1.5 rounded-full bg-slate-200 overflow-hidden shrink-0">
-              <div class="h-full rounded-full ${isOk ? "bg-emerald-500" : isShort ? "bg-amber-500" : "bg-red-500"}" style="width: ${confPercent}%"></div>
+              <div class="h-full rounded-full ${isOk ? "bg-emerald-500" : isShort ? "bg-amber-500" : isLowConf ? "bg-amber-500" : "bg-red-500"}" style="width: ${confPercent}%"></div>
             </div>
             <span class="font-mono text-[10px] font-semibold text-slate-600">${confPercent}% conf</span>
           </div>
-          <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: line.line_number || "N/A" })}</span>
+          <span class="text-[10px] text-slate-400 font-mono">${t("lineNum", { num: escapeHtml(String(line.line_number || "N/A")) })}</span>
         </div>
 
         ${reviewActionHtml}
@@ -1376,11 +1453,45 @@
       `;
     }
 
+    // Honest OCR Fallback Banner Detection (QA D0-04)
+    const isFallbackMode = Boolean(
+      state.isDemoFallback ||
+      (scanResultOrPayload && (scanResultOrPayload.is_demo_fallback || scanResultOrPayload.is_fallback)) ||
+      !state.isRealOcr
+    );
+
+    let bannerHtml = "";
+    if (isFallbackMode) {
+      bannerHtml = `
+        <div class="p-3 bg-amber-50 border border-amber-300 rounded-xl text-amber-950 text-xs flex items-center gap-2.5 shadow-sm">
+          <span class="text-base shrink-0">⚠️</span>
+          <div>
+            <div class="font-bold tracking-tight text-amber-900 uppercase text-[11px]">DEMO SAMPLE / FALLBACK DATA</div>
+            <div class="text-[11px] text-amber-800 leading-tight mt-0.5">Real AI OCR was unavailable or demo scan was selected. Using deterministic baseline sample data.</div>
+          </div>
+        </div>
+      `;
+    } else {
+      bannerHtml = `
+        <div class="p-3 bg-emerald-50 border border-emerald-300 rounded-xl text-emerald-950 text-xs flex items-center gap-2.5 shadow-sm">
+          <span class="text-base shrink-0">✨</span>
+          <div>
+            <div class="font-bold tracking-tight text-emerald-900 uppercase text-[11px]">REAL AI OCR ACTIVE</div>
+            <div class="text-[11px] text-emerald-800 leading-tight mt-0.5">Delivery note line items extracted and mapped live via Google Gemini Vision.</div>
+          </div>
+        </div>
+      `;
+    }
+
     // Dynamic Summary Math directly from payload
     const totalLines = payload.length;
-    const okCount = payload.filter((item) => item.match_status === "OK" && (item.ordered_qty === undefined || item.received_qty === item.ordered_qty)).length;
+    const okCount = payload.filter((item) => {
+      const isExactQty = item.ordered_qty === undefined || item.received_qty === item.ordered_qty;
+      const isConfOk = (item.confidence_score === undefined || item.confidence_score >= 0.75) && !item.low_confidence;
+      return item.match_status === "OK" && isExactQty && isConfOk;
+    }).length;
     const discrepancyCount = totalLines - okCount;
-    const lowConfCount = payload.filter((item) => (item.confidence_score || 0) < 0.85).length;
+    const lowConfCount = payload.filter((item) => (item.confidence_score !== undefined && item.confidence_score < 0.75) || item.low_confidence).length;
     const discLabel = discrepancyCount === 1 ? "Discrepancy" : "Discrepancies";
 
     // Partition lines: if 5 or fewer items, show all directly; otherwise spotlight + accordion
@@ -1411,6 +1522,9 @@
 
     return `
       <div class="flex-1 p-3.5 space-y-3.5 pb-24">
+        <!-- Honest OCR Fallback Banner -->
+        ${bannerHtml}
+
         <!-- Summary Banner -->
         <section class="bg-white rounded-xl p-3.5 border border-slate-200 shadow-sm space-y-2">
           <div class="flex items-start justify-between">
@@ -1441,8 +1555,8 @@
               <span>!</span> ${discrepancyCount} ${discLabel}
             </span>
             ${lowConfCount > 0 ? `
-              <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-red-100 text-red-900 border border-red-300">
-                <span>✕</span> ${lowConfCount} Low Confidence
+              <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                <span>⚠️</span> ${lowConfCount} Low Confidence
               </span>
             ` : ""}
           </div>
@@ -1482,13 +1596,15 @@
                     (item) => `
                   <div class="py-2.5 flex items-center justify-between text-xs">
                     <div class="min-w-0 pr-2">
-                      <div class="font-bold text-slate-900 truncate">${item.item_name}</div>
-                      <div class="font-mono text-[11px] text-slate-500">${item.sku_code} &bull; ${item.received_qty} / ${item.ordered_qty || 0} ${item.unit || ''}</div>
+                      <div class="font-bold text-slate-900 truncate">${escapeHtml(item.item_name || 'Item')}</div>
+                      <div class="font-mono text-[11px] text-slate-500">${escapeHtml(item.sku_code)} &bull; ${item.received_qty} / ${item.ordered_qty || 0} ${escapeHtml(item.unit || '')}</div>
                     </div>
                     <div class="shrink-0 flex items-center gap-1.5">
-                      <span class="text-[10px] font-mono text-slate-400">${Math.round((item.confidence_score || 0.98) * 100)}%</span>
-                      ${item.match_status === "OK" && (item.ordered_qty === undefined || item.received_qty === item.ordered_qty)
+                      <span class="text-[10px] font-mono text-slate-400">${Math.round(((item.confidence_score !== undefined ? item.confidence_score : 0.98)) * 100)}%</span>
+                      ${item.match_status === "OK" && (item.ordered_qty === undefined || item.received_qty === item.ordered_qty) && !((item.confidence_score !== undefined && item.confidence_score < 0.75) || item.low_confidence)
                         ? `<span class="bg-green-100 text-green-800 px-1.5 py-0.5 rounded text-[10px] font-bold border border-green-200 whitespace-nowrap">100% matched</span>`
+                        : ((item.confidence_score !== undefined && item.confidence_score < 0.75) || item.low_confidence)
+                        ? `<span class="bg-amber-100 text-amber-900 px-1.5 py-0.5 rounded text-[10px] font-bold border border-amber-300 whitespace-nowrap">LOW CONF</span>`
                         : item.match_status === "SHORT" || (item.ordered_qty !== undefined && item.received_qty < item.ordered_qty)
                         ? `<span class="bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded text-[10px] font-bold border border-yellow-200 whitespace-nowrap">SHORT</span>`
                         : item.match_status === "OVER" || (item.ordered_qty !== undefined && item.received_qty > item.ordered_qty)
@@ -1552,7 +1668,7 @@
               <span class="text-xs font-bold text-emerald-700 uppercase tracking-wider">${t("postedSynced")}</span>
               <h2 class="text-lg font-extrabold text-slate-900 mt-0.5">${t("postedHubTitle", { sec: state.lastElapsedSeconds || "0.2" })}</h2>
               <p class="text-xs text-slate-600 max-w-xs mx-auto mt-1">
-                ${t("postedHubSub", { voucher: erp.erp_voucher_no || "ERP-VOUCH" })}
+                ${t("postedHubSub", { voucher: escapeHtml(erp.erp_voucher_no || "ERP-VOUCH") })}
               </p>
             `
       }
@@ -1583,7 +1699,7 @@
 
                     return `
                       <div class="flex items-center justify-between py-1 border-b border-slate-100 animate-float-up" style="animation-delay: ${delayMs}ms;">
-                        <span class="text-slate-800 font-medium">${line.sku_code}</span>
+                        <span class="text-slate-800 font-medium">${escapeHtml(line.sku_code)}</span>
                         ${chipHtml}
                       </div>
                     `;
@@ -1612,8 +1728,8 @@
 
           <!-- Transaction Identifiers -->
           <div class="bg-slate-100 rounded-xl p-3 text-left space-y-1 text-[11px] font-mono text-slate-600 border border-slate-200">
-            <div><span class="font-semibold text-slate-800">PO:</span> <span class="whitespace-nowrap po-badge">PO&#8209;48213</span> &bull; ${DEFAULT_STORE}</div>
-            <div class="truncate"><span class="font-semibold text-slate-800">Key:</span> ${state.lastConfirmedKey || "Pending"}</div>
+            <div><span class="font-semibold text-slate-800">PO:</span> <span class="whitespace-nowrap po-badge">PO&#8209;48213</span> &bull; ${escapeHtml(DEFAULT_STORE)}</div>
+            <div class="truncate"><span class="font-semibold text-slate-800">Key:</span> ${escapeHtml(state.lastConfirmedKey || "Pending")}</div>
             <div><span class="font-semibold text-slate-800">Queue status:</span> ${state.offlineQueue.length} pending sync</div>
           </div>
         </div>
@@ -1809,9 +1925,12 @@
       ? (state.scanResult.lines || state.scanResult.items || [])
       : [];
 
-    const discrepancies = payload.filter(
-      (l) => l.match_status !== "OK" || (l.ordered_qty !== undefined && l.received_qty !== l.ordered_qty)
-    );
+    const discrepancies = payload.filter((l) => {
+      const isShortOrOver = l.ordered_qty !== undefined && l.received_qty !== l.ordered_qty;
+      const isUnknown = l.match_status === "UNKNOWN_SKU";
+      const isLowConf = (l.confidence_score !== undefined && l.confidence_score < 0.75) || l.low_confidence;
+      return l.match_status !== "OK" || isShortOrOver || isUnknown || isLowConf;
+    });
 
     const unresolvedDiscrepancies = discrepancies.filter((l) => {
       if (l.sku_code === "PLAST-01") return !state.plastReview.reviewed;
@@ -1825,11 +1944,11 @@
 
     let guidanceHtml = "";
     if (unresolvedDiscrepancies.length > 0) {
-      const skuList = unresolvedDiscrepancies.map((l) => l.sku_code).join(", ");
+      const skuList = escapeHtml(unresolvedDiscrepancies.map((l) => l.sku_code).join(", "));
       guidanceHtml = `
         <div class="flex items-center justify-between text-[11px] font-semibold text-amber-900 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-200">
           <span class="flex items-center gap-1 truncate mr-2">
-            <span>⚠</span> Review discrepancy: ${skuList}
+            <span>⚠</span> Review discrepancy / low conf: ${skuList}
           </span>
           <span class="font-mono text-[10px] text-amber-700 font-bold shrink-0">${reviewedCount}/${totalDiscrepancies}</span>
         </div>

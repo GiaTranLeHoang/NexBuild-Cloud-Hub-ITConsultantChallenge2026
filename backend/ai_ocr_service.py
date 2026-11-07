@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -266,8 +267,28 @@ Convert bulk weights, lengths, or pallets into the catalog packaging unit BEFORE
                 raise ValueError(f"Expected JSON list, got {type(parsed_items)}")
 
             for item in parsed_items:
-                if "confidence_score" not in item:
-                    item["confidence_score"] = 0.92
+                # QA D0-01: Strict Quantity Validation
+                try:
+                    raw_qty = float(item.get("received_qty", 0.0))
+                    if math.isnan(raw_qty) or math.isinf(raw_qty) or raw_qty < 0.0:
+                        raw_qty = 0.0
+                except (ValueError, TypeError):
+                    raw_qty = 0.0
+                item["received_qty"] = raw_qty
+
+                # QA D0-05: Confidence score parsing & low confidence gate (<0.75)
+                try:
+                    conf = float(item.get("confidence_score", 0.92))
+                    if math.isnan(conf) or math.isinf(conf):
+                        conf = 0.92
+                    else:
+                        conf = max(0.0, min(1.0, conf))
+                except (ValueError, TypeError):
+                    conf = 0.92
+                item["confidence_score"] = round(conf, 3)
+                item["low_confidence"] = conf < 0.75
+                item["requires_review"] = conf < 0.75
+                item["is_demo_fallback"] = False
 
             return parsed_items
 
@@ -275,10 +296,24 @@ Convert bulk weights, lengths, or pallets into the catalog packaging unit BEFORE
             # Graceful Fallback (Except Block)
             print(f"Real OCR Failed, falling back to mock: {e}")
             logger.warning(f"Real OCR Failed, falling back to mock: {e}")
-            return _get_demo_lines()
+            fallback_lines = _get_demo_lines()
+            for item in fallback_lines:
+                item["is_demo_fallback"] = True
+                conf = float(item.get("confidence_score", 1.0))
+                item["low_confidence"] = conf < 0.75
+                if item["low_confidence"]:
+                    item["requires_review"] = True
+            return fallback_lines
 
-    # Deterministic fallback when use_demo_sample=True or no image_bytes
-    return _get_demo_lines()
+    # Deterministic mock when use_demo_sample=True or no image_bytes provided
+    demo_lines = _get_demo_lines()
+    for item in demo_lines:
+        item["is_demo_fallback"] = False
+        conf = float(item.get("confidence_score", 1.0))
+        item["low_confidence"] = conf < 0.75
+        if item["low_confidence"]:
+            item["requires_review"] = True
+    return demo_lines
 
 
 # ---------------------------------------------------------------------------

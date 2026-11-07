@@ -268,6 +268,8 @@
         delivery_note_id: "DN-DK-2026-94821",
         scan_timestamp: new Date().toISOString(),
         ocr_engine: "NexBuild-Gemini-Vision-v2.5 (Demo Fallback)",
+        is_fallback: true,
+        is_demo_fallback: true,
         items: lines,
         lines: lines,
         summary: {
@@ -533,12 +535,17 @@
         }
 
         if (!resp.ok) {
-          // Standard error JSON contract
+          // Standard error JSON contract - safe string extraction (QA D0-06)
+          const errorMsg =
+            (typeof data.detail === "string" ? data.detail : (data.detail && typeof data.detail === "object" && data.detail.message)) ||
+            (data.detail && typeof data.detail === "object" && data.detail.error_code ? `${data.detail.error_code}: ${data.detail.message || "Request failed"}` : null) ||
+            data.message ||
+            `Request failed with status ${resp.status}`;
           const errorObj = {
             status: "error",
-            error_code: data.error_code || `HTTP_${resp.status}`,
-            message: data.message || data.detail || `Request failed with status ${resp.status}`,
-            details: data.details || {},
+            error_code: data.error_code || (data.detail && data.detail.error_code) || `HTTP_${resp.status}`,
+            message: errorMsg,
+            details: data.details || data.detail || {},
             __http_status: resp.status,
           };
           return errorObj;
@@ -557,9 +564,15 @@
 
         return data;
       } catch (err) {
-        console.warn(
-          `[Api] Live backend request to ${path} failed (${err.message}). Auto-falling back to Mock mode for '${fnName}'.`
-        );
+        console.warn(`[Api] Live backend request to ${path} failed:`, err);
+        // Honest Network State (QA D0-02): If in live mode and request fails, do NOT pretend it succeeded!
+        return {
+          status: "error",
+          error_code: "NETWORK_ERROR",
+          message: `Network/Server connection failed: ${err.message || "Unable to reach backend API"}`,
+          details: { original_error: String(err) },
+          __http_status: 0,
+        };
       }
     }
 

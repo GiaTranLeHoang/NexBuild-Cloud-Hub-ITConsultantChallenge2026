@@ -26,6 +26,7 @@ Compatible with Python 3.9+.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -123,12 +124,50 @@ def reconcile_scanned_items(
         if record.get("sku"):
             po_lookup[record["sku"]] = record  # accept legacy key too
 
+    # ---- Duplicate SKU Aggregation & Quantity Sanitization (QA D0-01, D0-03) ----
+    aggregated_items: List[Dict[str, Any]] = []
+    sku_index_map: Dict[str, int] = {}
+    is_any_fallback = False
+
+    for item in scanned_items:
+        raw_sku = (item.get("sku_code") or item.get("sku") or "").strip()
+        # Sanitize quantity: reject negative, NaN, Inf
+        try:
+            raw_qty = float(item.get("received_qty", 0.0))
+            if math.isnan(raw_qty) or math.isinf(raw_qty) or raw_qty < 0.0:
+                qty = 0.0
+            else:
+                qty = raw_qty
+        except (ValueError, TypeError):
+            qty = 0.0
+
+        if item.get("is_demo_fallback"):
+            is_any_fallback = True
+
+        if raw_sku and raw_sku in sku_index_map:
+            # Duplicate SKU detected: aggregate quantity
+            existing = aggregated_items[sku_index_map[raw_sku]]
+            existing["received_qty"] += qty
+            existing["scanned_qty"] = existing["received_qty"]
+            # Preserve lowest confidence score for security gate
+            item_conf = float(item.get("confidence_score") or 1.0)
+            existing["confidence_score"] = min(float(existing.get("confidence_score", 1.0)), item_conf)
+            if item.get("is_demo_fallback") or existing.get("is_demo_fallback"):
+                existing["is_demo_fallback"] = True
+        else:
+            item_copy = dict(item)
+            item_copy["received_qty"] = qty
+            item_copy["scanned_qty"] = qty
+            if raw_sku:
+                sku_index_map[raw_sku] = len(aggregated_items)
+            aggregated_items.append(item_copy)
+
     # ---- Iterate over scanned items and apply matching rules -------------
     matched_items: List[Dict[str, Any]] = []
     ok_count:       int = 0
     mismatch_count: int = 0
 
-    for idx, scanned in enumerate(scanned_items, start=1):
+    for idx, scanned in enumerate(aggregated_items, start=1):
         # Normalise scanned item keys (handle both sku_code and legacy sku)
         sku_code: str = (
             scanned.get("sku_code")
@@ -159,9 +198,17 @@ def reconcile_scanned_items(
             if received_qty == ordered_qty:
                 match_status      = "OK"
                 confidence_score  = float(scanned.get("confidence_score") or CONFIDENCE_OK)
-                requires_review   = False
-                discrepancy_reason: Optional[str] = None
-                ok_count += 1
+                # QA D0-05: Low confidence gate forces review even if qty matches
+                is_low_conf = confidence_score < 0.75
+                requires_review   = is_low_conf
+                discrepancy_reason: Optional[str] = (
+                    f"Low confidence ({confidence_score * 100:.1f}% < 75%): Manual physical inspection required."
+                    if is_low_conf else None
+                )
+                if not is_low_conf:
+                    ok_count += 1
+                else:
+                    mismatch_count += 1
 
             elif received_qty < ordered_qty:
                 match_status       = "SHORT"
@@ -185,6 +232,7 @@ def reconcile_scanned_items(
                 )
                 mismatch_count += 1
 
+            is_low_conf = confidence_score < 0.75
             matched_items.append({
                 "line_number":       line_number,
                 "sku_code":          sku_code,
@@ -197,30 +245,33 @@ def reconcile_scanned_items(
                 "unit":              canonical_unit,
                 "match_status":      match_status,
                 "confidence_score":  round(confidence_score, 3),
+                "low_confidence":    is_low_conf,
                 "requires_review":   requires_review,
                 "discrepancy_reason": discrepancy_reason,
                 "discrepancy_note":  discrepancy_reason,  # alias
             })
 
         else:
-            # ---- UNKNOWN_SKU: item physically arrived but NOT on the PO ----
+            # ---- UNKNOWN_SKU: item physically arrived but NOT on the PO (QA D0-01) ----
             conf_unknown = float(scanned.get("confidence_score") or CONFIDENCE_UNKNOWN_SKU)
+            is_low_conf = conf_unknown < 0.75
             matched_items.append({
                 "line_number":       None,
                 "sku_code":          sku_code,
                 "sku":               sku_code,
                 "item_name":         item_name,
                 "description":       item_name,
-                "ordered_qty":       0.0,
+                "ordered_qty":       0.0,  # Zero PO ordered qty ensures no unapproved ATP increment
                 "received_qty":      received_qty,
                 "scanned_qty":       received_qty,
                 "unit":              unit,
                 "match_status":      "UNKNOWN_SKU",
                 "confidence_score":  round(conf_unknown, 3),  # 0.68 — explicit spec requirement
+                "low_confidence":    is_low_conf,
                 "requires_review":   True,
                 "discrepancy_reason": (
                     f"Unordered SKU: '{sku_code}' is not present on PO {po_number}. "
-                    f"Received {received_qty:g} {unit}. Quarantine pending manager approval."
+                    f"Received {received_qty:g} {unit}. Quarantined pending manager approval (excluded from ATP)."
                 ),
                 "discrepancy_note":  (
                     f"Unordered SKU: '{sku_code}' is not present on PO {po_number}."
@@ -231,7 +282,7 @@ def reconcile_scanned_items(
     # ---- Build summary --------------------------------------------------
     low_confidence_count = sum(
         1 for item in matched_items
-        if item["confidence_score"] < LOW_CONFIDENCE_THRESHOLD
+        if item["confidence_score"] < LOW_CONFIDENCE_THRESHOLD or item.get("low_confidence")
     )
 
     summary: Dict[str, Any] = {
@@ -247,6 +298,12 @@ def reconcile_scanned_items(
         "requires_supervisor_approval": mismatch_count > 0,
     }
 
+    ocr_engine_label = (
+        "NexBuild-Deterministic-Fallback (Demo)"
+        if is_any_fallback
+        else "NexBuild-Gemini-Vision-v2.5"
+    )
+
     return {
         "status":           "success",
         "po_number":        po_number,
@@ -254,7 +311,9 @@ def reconcile_scanned_items(
         "supplier":         supplier_name,   # backward compat
         "delivery_note_id": "DN-DK-2026-94821",
         "scan_timestamp":   datetime.now(timezone.utc).isoformat() + "Z",
-        "ocr_engine":       "NexBuild-Gemini-Vision-v2.5",
+        "ocr_engine":       ocr_engine_label,
+        "is_fallback":      is_any_fallback,
+        "is_demo_fallback": is_any_fallback,
         "items":            matched_items,
         "lines":            matched_items,   # alias for ScanDeliveryNoteResponse
         "summary":          summary,
